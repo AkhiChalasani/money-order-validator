@@ -106,6 +106,33 @@ OCR context:
 {ocr_context}
 """.strip()
 
+DEPOSIT_TICKET_ITEMS_PROMPT = """
+Extract handwritten line items from a bank deposit ticket/slip page.
+Return JSON only:
+{
+  "items": [
+    {
+      "item_no": integer|null,
+      "unit": string|null,
+      "amount_numeric": number|null
+    }
+  ]
+}
+Rules:
+- Use the numbered rows in the deposit ticket table only.
+- The row amount is split across DOLLARS and CENTS columns. Combine them exactly.
+  Example: DOLLARS=610 and CENTS=50 -> amount_numeric=610.50.
+- If the total or page is upside down, rotate mentally and read the rows upright.
+- Do not extract the preprinted MICR/account number as an item.
+- Do not extract the deposit total as an item.
+- Stop at the last filled row. Empty rows must not be returned.
+- Return [] if no row-level item amounts are visible.
+
+OCR context:
+{ocr_context}
+""".strip()
+
+
 REGISTER_ITEMS_PROMPT = """
 Extract the item/register rows from this bank deposit report or property-management batch table.
 Return JSON only:

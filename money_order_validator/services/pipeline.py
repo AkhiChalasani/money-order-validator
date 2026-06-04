@@ -236,9 +236,14 @@ def _aggregate_deposit_slips(slips: List[Dict[str, Any]]) -> Dict[str, Any]:
         return {}
     out: Dict[str, Any] = {}
     for row in slips:
-        for key in ("bank_name", "source_system", "deposit_account", "account_last4", "account_name", "deposit_date"):
+        # Non-total metadata: keep the first useful value. deposit_date handled separately
+        # because upside-down handwritten slips can OCR 2026 as 2024.
+        for key in ("bank_name", "source_system", "deposit_account", "account_last4", "account_name"):
             if not out.get(key) and row.get(key) not in (None, "", [], {}):
                 out[key] = row[key]
+    dates = [str(row.get("deposit_date")) for row in slips if row.get("deposit_date")]
+    if dates:
+        out["deposit_date"] = sorted(dates)[-1]
     amounts = [_deposit_amount_value(row) for row in slips if _deposit_amount_value(row) is not None]
     unique_amount_slips = [row for row in slips if _deposit_amount_value(row) is not None]
     if amounts:
@@ -284,7 +289,11 @@ def _bad_property_candidate(value: Optional[str]) -> bool:
     if not value:
         return True
     compact = re.sub(r"[^A-Z0-9]", "", str(value).upper())
-    return compact in {"CENTS", "DOLLARS", "DOLLAR", "CURRENCY", "COIN", "TOTAL", "CHASE", "JPMORGANCHASEBANK", "REGIONS"}
+    return compact in {
+        "CENTS", "DOLLARS", "DOLLAR", "CURRENCY", "COIN", "TOTAL",
+        "CHASE", "JPMORGANCHASEBANK", "REGIONS", "DEPOSIT", "DEPOSITTICKET",
+        "DEPOSITSLIP", "PLEASEENTERLOCALBRANCHTOTAL",
+    }
 
 
 def _infer_property_from_instruments(instruments: List[Dict[str, Any]]) -> Optional[str]:
@@ -366,6 +375,56 @@ def _item_match_score(inst: Dict[str, Any], item: Dict[str, Any]) -> int:
     if inst.get("unit") and item.get("unit") and str(inst.get("unit")) == str(item.get("unit")):
         score += 10
     return score
+
+
+def _sequence_group_key(row: Dict[str, Any]) -> Optional[int]:
+    if row.get("source") != "deposit_ticket_sequence":
+        return None
+    try:
+        return int(row.get("slip_page_number"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _adjust_deposit_slips_from_sequence_items(slips: List[Dict[str, Any]], items: List[Dict[str, Any]]) -> None:
+    """Correct deposit-ticket totals using extracted row-level amounts.
+
+    Handwritten Chase deposit-ticket totals are often OCR'd incorrectly (e.g. 3,448.80
+    instead of 5,448.80). If the row count matches the slip item count, the sum of the
+    filled table rows is more reliable than the handwritten total.
+    """
+    by_page: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for item in items:
+        page = _sequence_group_key(item)
+        if page is not None:
+            by_page[page].append(item)
+    for slip in slips:
+        try:
+            page = int(slip.get("page_number"))
+        except (TypeError, ValueError):
+            continue
+        rows = by_page.get(page) or []
+        if not rows:
+            continue
+        row_sum = round(sum(_as_float(r.get("amount_numeric")) or 0.0 for r in rows), 2)
+        if row_sum <= 0:
+            continue
+        try:
+            item_count = int(slip.get("item_count") or 0)
+        except (TypeError, ValueError):
+            item_count = 0
+        old_amount = _deposit_amount_value(slip)
+        if (item_count and item_count == len(rows)) or old_amount is None or abs(row_sum - float(old_amount)) >= 10.0:
+            slip["deposit_amount"] = row_sum
+            slip["deposit_total"] = row_sum
+            slip["check_total"] = row_sum
+            slip["item_count"] = len(rows) if not item_count else item_count
+            slip.setdefault("corrections", []).append({
+                "field": "deposit_amount",
+                "old": old_amount,
+                "new": row_sum,
+                "source": "deposit_ticket_row_sum",
+            })
 
 
 class DocumentProcessor:
@@ -459,6 +518,20 @@ class DocumentProcessor:
                     log_row["llm_used"] = True
                     log_row["deposit_vision_used"] = True
 
+            if _page_has_deposit_ticket(ocr_text, page_deposit) and (page_deposit.get("item_count") or kind in {PageKind.DEPOSIT_SLIP, PageKind.DEPOSIT_REPORT, PageKind.REPORT_WITH_INSTRUMENTS, PageKind.UNKNOWN}):
+                seq_items, usage, used = await vision_extractor.extract_deposit_ticket_items(image, ocr_text)
+                if used:
+                    llm_calls += 1
+                    self._accumulate_usage(usage_total, usage)
+                    phase_tokens["deposit_items"] += usage.total_tokens
+                    log_row["llm_used"] = True
+                    log_row["deposit_ticket_items_vision_used"] = True
+                if seq_items:
+                    for row in seq_items:
+                        row["slip_page_number"] = page_number
+                    register_items.extend(seq_items)
+                    log_row["deposit_ticket_items"] = len(seq_items)
+
             if kind in {PageKind.BACK, PageKind.BLANK, PageKind.RECEIPT}:
                 page_logs.append(log_row)
                 continue
@@ -498,7 +571,7 @@ class DocumentProcessor:
                     log_row["llm_used"] = True
                 kept = 0
                 sanitized_page: List[Dict[str, Any]] = [sanitize_instrument(inst, ocr_text=ocr_text) for inst in instruments]
-                for inst in sanitized_page:
+                for local_idx, inst in enumerate(sanitized_page, start=1):
                     if _is_back_page_artifact(inst, ocr_text):
                         logger.info("Dropped back-page artifact on page %d: serial=%s amount=%s", page_number, inst.get("serial_number"), inst.get("amount_numeric"))
                         continue
@@ -511,6 +584,7 @@ class DocumentProcessor:
                         logger.info("Dropped deposit-ticket artifact on page %d: serial=%s amount=%s", page_number, inst.get("serial_number"), inst.get("amount_numeric"))
                         continue
                     inst["page_number"] = page_number
+                    inst["_page_item_index"] = local_idx
                     inst["source_file"] = file_name
                     inst["llm_used"] = bool(used)
                     inst["processing_tier"] = 3 if used else 1
@@ -524,7 +598,10 @@ class DocumentProcessor:
 
         register_items = self._dedupe_register_items(register_items)
         raw_instruments = self._dedupe_raw_instruments(raw_instruments)
-        raw_instruments = self._reconcile_register_items(raw_instruments, register_items)
+        _adjust_deposit_slips_from_sequence_items(deposit_slips, register_items)
+        raw_instruments = self._apply_deposit_ticket_sequences(raw_instruments, register_items)
+        non_sequence_register_items = [i for i in register_items if i.get("source") != "deposit_ticket_sequence"]
+        raw_instruments = self._reconcile_register_items(raw_instruments, non_sequence_register_items)
         aggregate_deposit = _aggregate_deposit_slips(deposit_slips)
         if aggregate_deposit:
             deposit_data = {**deposit_data, **aggregate_deposit}
@@ -594,12 +671,66 @@ class DocumentProcessor:
                 normalize_serial(row.get("serial_number")) or normalize_serial(row.get("check_number")) or "",
                 _as_float(row.get("amount_numeric")),
                 row.get("item_no"),
+                row.get("slip_page_number") if row.get("source") == "deposit_ticket_sequence" else None,
             )
             if key in seen:
                 continue
             seen.add(key)
             out.append(row)
         return out
+
+    @staticmethod
+    def _apply_deposit_ticket_sequences(instruments: List[Dict[str, Any]], items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Apply ordered handwritten deposit-ticket amounts to following instruments.
+
+        Deposit tickets in these batches are immediately followed by the physical items
+        in the same row order. The slip rows often contain the only reliable values when
+        an instrument front is upside down.
+        """
+        seq_pages = sorted({p for p in (_sequence_group_key(i) for i in items) if p is not None})
+        if not seq_pages:
+            return instruments
+
+        for n, slip_page in enumerate(seq_pages):
+            next_slip_page = seq_pages[n + 1] if n + 1 < len(seq_pages) else 10**9
+            seq_rows = [i for i in items if _sequence_group_key(i) == slip_page]
+            seq_rows.sort(key=lambda r: int(r.get("item_no") or 999999))
+            targets = [
+                inst for inst in instruments
+                if (inst.get("page_number") or 0) > slip_page
+                and (inst.get("page_number") or 0) < next_slip_page
+                and not inst.get("missing_from_scan")
+                and not _is_deposit_ticket_artifact(
+                    inst,
+                    ocr_text="",
+                    page_deposit=None,
+                    page_instruments=instruments,
+                )
+            ]
+            targets.sort(key=lambda r: (r.get("page_number") or 999999, r.get("_page_item_index") or 0))
+            if not seq_rows or not targets:
+                continue
+            if abs(len(seq_rows) - len(targets)) > 1:
+                continue
+            for row, inst in zip(seq_rows, targets):
+                seq_amount = _as_float(row.get("amount_numeric"))
+                if seq_amount is None:
+                    continue
+                old_amount = _as_float(inst.get("amount_numeric"))
+                if old_amount != seq_amount:
+                    inst.setdefault("corrections", []).append({
+                        "field": "amount_numeric",
+                        "old": old_amount,
+                        "new": seq_amount,
+                        "source": "deposit_ticket_sequence",
+                        "slip_page_number": slip_page,
+                        "row_item_no": row.get("item_no"),
+                    })
+                    inst["amount_numeric"] = seq_amount
+                if row.get("unit") and not inst.get("unit"):
+                    inst["unit"] = str(row.get("unit"))
+                inst["matched_deposit_ticket_item"] = True
+        return instruments
 
     def _reconcile_register_items(self, instruments: List[Dict[str, Any]], items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         matched_items = set()
@@ -681,11 +812,12 @@ class DocumentProcessor:
         amount = _as_float(batch_data.get("batch_amount"))
         deposit_amount = _as_float(deposit_data.get("deposit_amount") or deposit_data.get("deposit_total") or deposit_data.get("check_total"))
         instrument_sum = round(sum(_as_float(i.get("amount_numeric")) or 0.0 for i in instruments), 2) if instruments else None
+        register_sum = round(sum(_as_float(i.get("amount_numeric")) or 0.0 for i in register_items), 2) if register_items else None
         deposit_count = int(deposit_data.get("deposit_slip_count") or 0)
         if amount is None:
             amount = deposit_amount
-        if amount is None and register_items:
-            amount = round(sum(_as_float(i.get("amount_numeric")) or 0.0 for i in register_items), 2)
+        if amount is None and register_sum is not None:
+            amount = register_sum
         if amount is None and instrument_sum is not None:
             amount = instrument_sum
         # When multiple physical deposit slips exist but only one total was captured, the
@@ -700,6 +832,13 @@ class DocumentProcessor:
             and abs(float(amount) - float(instrument_sum)) / max(float(amount), float(instrument_sum), 1.0) > 0.15
         ):
             amount = instrument_sum
+        if (
+            amount is not None
+            and register_sum is not None
+            and abs(float(amount) - float(register_sum)) > 1.00
+            and (instrument_sum is None or abs(float(register_sum) - float(instrument_sum)) <= 1.00)
+        ):
+            amount = register_sum
 
         total_items = batch_data.get("total_items") or deposit_data.get("item_count")
         try:

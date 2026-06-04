@@ -9,6 +9,7 @@ from money_order_validator.clients.azure_openai import llm_client
 from money_order_validator.prompts import (
     BATCH_HEADER_PROMPT,
     DEPOSIT_SLIP_PROMPT,
+    DEPOSIT_TICKET_ITEMS_PROMPT,
     INSTRUMENT_EXTRACTION_PROMPT,
     LLM_SYSTEM_MSG,
     REGISTER_ITEMS_PROMPT,
@@ -131,6 +132,48 @@ class VisionExtractor:
                     merged[k] = v
         return merged, usage, True
 
+    async def extract_deposit_ticket_items(self, image: Image.Image, ocr_text: str) -> Tuple[List[Dict[str, Any]], TokenUsage, bool]:
+        """Extract handwritten deposit-ticket row amounts.
+
+        Used only as an ordered reconciliation source for the instruments scanned
+        after the slip. Not emitted as standalone missing-from-scan rows.
+        """
+        if not llm_client.available:
+            return [], TokenUsage(), False
+        prompt = DEPOSIT_TICKET_ITEMS_PROMPT.replace("{ocr_context}", compact_ocr_context(ocr_text, max_chars=3000) or "(no OCR text available)")
+        raw, usage = await llm_client.json_vision(
+            system_prompt=LLM_SYSTEM_MSG,
+            user_prompt=prompt,
+            image=crop_to_content(image),
+            max_width=settings.report_image_width,
+            detail="high",
+            max_completion_tokens=1600,
+        )
+        items_raw = raw.get("items") if isinstance(raw, dict) else None
+        if not isinstance(items_raw, list):
+            return [], usage, True
+        items: List[Dict[str, Any]] = []
+        for idx, item in enumerate(items_raw, start=1):
+            if not isinstance(item, dict):
+                continue
+            amount = item.get("amount_numeric")
+            try:
+                amount_f = round(float(str(amount).replace(",", "")), 2)
+            except (TypeError, ValueError):
+                continue
+            if amount_f <= 0:
+                continue
+            row = {
+                "item_no": item.get("item_no") or idx,
+                "unit": item.get("unit"),
+                "amount_numeric": amount_f,
+                "source": "deposit_ticket_sequence",
+                "payment_description": "Payment-MoneyOrder",
+                "instrument_type": "MoneyOrder",
+            }
+            items.append(row)
+        return items, usage, True
+
     async def extract_register_items(self, image: Image.Image, ocr_text: str) -> Tuple[List[Dict[str, Any]], TokenUsage, bool]:
         """Extract bank/property register rows from a deposit report page.
 
@@ -140,7 +183,7 @@ class VisionExtractor:
         parsed = parse_batch_line_items(ocr_text)
         if parsed or not llm_client.available:
             return parsed, TokenUsage(), False
-        prompt = REGISTER_ITEMS_PROMPT.format(ocr_context=compact_ocr_context(ocr_text, max_chars=4000) or "(no OCR text available)")
+        prompt = REGISTER_ITEMS_PROMPT.replace("{ocr_context}", compact_ocr_context(ocr_text, max_chars=4000) or "(no OCR text available)")
         raw, usage = await llm_client.json_vision(
             system_prompt=LLM_SYSTEM_MSG,
             user_prompt=prompt,
