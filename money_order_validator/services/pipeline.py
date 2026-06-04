@@ -238,9 +238,14 @@ def _aggregate_deposit_slips(slips: List[Dict[str, Any]]) -> Dict[str, Any]:
     for row in slips:
         # Non-total metadata: keep the first useful value. deposit_date handled separately
         # because upside-down handwritten slips can OCR 2026 as 2024.
-        for key in ("bank_name", "source_system", "deposit_account", "account_last4", "account_name"):
+        for key in ("bank_name", "source_system", "account_last4", "account_name"):
             if not out.get(key) and row.get(key) not in (None, "", [], {}):
                 out[key] = row[key]
+    accounts = [str(row.get("deposit_account")) for row in slips if row.get("deposit_account") not in (None, "", [], {})]
+    if accounts:
+        # Chase deposit tickets often OCR the first MICR group as the account on one page and the
+        # true deposit account on a later ticket. Prefer the latest non-empty account for the batch.
+        out["deposit_account"] = accounts[-1]
     dates = [str(row.get("deposit_date")) for row in slips if row.get("deposit_date")]
     if dates:
         out["deposit_date"] = sorted(dates)[-1]
@@ -325,10 +330,19 @@ def _is_deposit_ticket_artifact(
     if not _page_has_deposit_ticket(ocr_text, page_deposit):
         return False
     inst_type = str(inst.get("instrument_type") or "").lower()
-    no_face_evidence = not inst.get("issue_date") and not inst.get("amount_words") and not inst.get("payer_signature")
+    issuer_text = " ".join(str(inst.get(k) or "") for k in ("issuer", "issuer_agent", "payer_name", "payee_raw", "micr_line")).upper()
+    no_amount = _as_float(inst.get("amount_numeric")) is None
+    no_payee = not normalize_payee(inst.get("payee_raw"))
+    no_written_amount = not inst.get("amount_words")
+    no_signature = not inst.get("payer_signature")
+    # A Chase deposit ticket can be hallucinated as a MoneyOrder/Check because it has a MICR line,
+    # a date, and a total box. It is not a physical instrument when it has no real payee/amount words.
+    if ("CHASE" in issuer_text or "JPMORGAN" in issuer_text) and no_payee and no_written_amount and (no_amount or no_signature):
+        return True
+    no_face_evidence = no_payee and no_written_amount and no_signature
     # Pure deposit tickets are sometimes returned as a MoneyOrder/Chase row because the MICR line
     # contains numeric groups. Drop any no-evidence row on a deposit-ticket page, not just checks.
-    if no_face_evidence and not normalize_payee(inst.get("payee_raw")) and _as_float(inst.get("amount_numeric")) is None:
+    if no_face_evidence and no_amount:
         return True
     if inst_type not in {"check", "cashierscheck"}:
         return False
@@ -424,6 +438,76 @@ def _adjust_deposit_slips_from_sequence_items(slips: List[Dict[str, Any]], items
                 "old": old_amount,
                 "new": row_sum,
                 "source": "deposit_ticket_row_sum",
+            })
+
+
+def _row_has_real_front_evidence(row: Dict[str, Any]) -> bool:
+    """True when a row looks like a real instrument front, not a form/back artifact."""
+    return bool(
+        _as_float(row.get("amount_numeric")) is not None
+        and (normalize_serial(row.get("serial_number")) or row.get("micr_line"))
+        and (normalize_payee(row.get("payee_raw")) or row.get("amount_words"))
+    )
+
+
+def _low_evidence_form_or_back_row(row: Dict[str, Any]) -> bool:
+    """Rows emitted from backs/deposit tickets often have only issuer/amount and no face fields."""
+    return bool(
+        not normalize_serial(row.get("serial_number"))
+        and not normalize_payee(row.get("payee_raw"))
+        and not row.get("issue_date")
+        and not row.get("amount_words")
+        and not row.get("payer_signature")
+    )
+
+
+def _correct_deposit_slips_from_following_instruments(slips: List[Dict[str, Any]], instruments: List[Dict[str, Any]]) -> None:
+    """Use the actual following physical instruments to correct handwritten Chase slip totals.
+
+    The focused deposit-ticket row reader can still miss a leading digit on a row. The physical
+    scan order is more stable: a Chase deposit ticket is followed by exactly its listed items,
+    until the next deposit ticket. When the following real instruments count matches the slip
+    item_count, their sum is the safest total.
+    """
+    slip_pages = sorted(
+        int(s.get("page_number")) for s in slips
+        if str(s.get("source_system") or s.get("bank_name") or "").lower().find("chase") >= 0
+        and str(s.get("page_number") or "").isdigit()
+    )
+    if not slip_pages:
+        return
+    for idx, page in enumerate(slip_pages):
+        next_page = slip_pages[idx + 1] if idx + 1 < len(slip_pages) else 10 ** 9
+        slip = next((s for s in slips if int(s.get("page_number") or -1) == page), None)
+        if not slip:
+            continue
+        targets = [
+            r for r in instruments
+            if (r.get("page_number") or 0) > page
+            and (r.get("page_number") or 0) < next_page
+            and not r.get("missing_from_scan")
+            and _row_has_real_front_evidence(r)
+        ]
+        if not targets:
+            continue
+        try:
+            item_count = int(slip.get("item_count") or 0)
+        except (TypeError, ValueError):
+            item_count = 0
+        if item_count and len(targets) != item_count:
+            continue
+        target_sum = round(sum(_as_float(r.get("amount_numeric")) or 0.0 for r in targets), 2)
+        old_amount = _deposit_amount_value(slip)
+        if target_sum > 0 and (old_amount is None or abs(target_sum - float(old_amount)) >= 1.00):
+            slip["deposit_amount"] = target_sum
+            slip["deposit_total"] = target_sum
+            slip["check_total"] = target_sum
+            slip["item_count"] = len(targets) if not item_count else item_count
+            slip.setdefault("corrections", []).append({
+                "field": "deposit_amount",
+                "old": old_amount,
+                "new": target_sum,
+                "source": "following_instrument_sum",
             })
 
 
@@ -598,8 +682,11 @@ class DocumentProcessor:
 
         register_items = self._dedupe_register_items(register_items)
         raw_instruments = self._dedupe_raw_instruments(raw_instruments)
+        raw_instruments = self._drop_form_and_back_artifacts(raw_instruments, deposit_slips)
         _adjust_deposit_slips_from_sequence_items(deposit_slips, register_items)
         raw_instruments = self._apply_deposit_ticket_sequences(raw_instruments, register_items)
+        raw_instruments = self._drop_form_and_back_artifacts(raw_instruments, deposit_slips)
+        _correct_deposit_slips_from_following_instruments(deposit_slips, raw_instruments)
         non_sequence_register_items = [i for i in register_items if i.get("source") != "deposit_ticket_sequence"]
         raw_instruments = self._reconcile_register_items(raw_instruments, non_sequence_register_items)
         aggregate_deposit = _aggregate_deposit_slips(deposit_slips)
@@ -676,6 +763,34 @@ class DocumentProcessor:
             if key in seen:
                 continue
             seen.add(key)
+            out.append(row)
+        return out
+
+    @staticmethod
+    def _drop_form_and_back_artifacts(rows: List[Dict[str, Any]], deposit_slips: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Remove pseudo instruments created from deposit tickets and adjacent back pages."""
+        deposit_pages = {
+            int(s.get("page_number")) for s in deposit_slips
+            if str(s.get("page_number") or "").isdigit()
+        }
+        valid_front_pages = {
+            int(r.get("page_number")) for r in rows
+            if str(r.get("page_number") or "").isdigit() and _row_has_real_front_evidence(r)
+        }
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            try:
+                page = int(row.get("page_number") or 0)
+            except (TypeError, ValueError):
+                page = 0
+            issuer_text = " ".join(str(row.get(k) or "") for k in ("issuer", "issuer_agent", "payer_name", "payee_raw", "micr_line")).upper()
+            on_deposit_page = page in deposit_pages
+            if on_deposit_page and ("CHASE" in issuer_text or "JPMORGAN" in issuer_text) and not normalize_payee(row.get("payee_raw")) and not row.get("amount_words"):
+                continue
+            # In these scans, a low-evidence row on the page immediately after a real instrument
+            # is nearly always the instrument back, not a new item.
+            if (page - 1) in valid_front_pages and _low_evidence_form_or_back_row(row):
+                continue
             out.append(row)
         return out
 
@@ -849,9 +964,19 @@ class DocumentProcessor:
             total_items = len(register_items) or len([i for i in instruments if not i.get("missing_from_scan")]) or None
 
         property_name = batch_data.get("property_name") or deposit_data.get("account_name")
+        inferred_property = False
         if _bad_property_candidate(property_name):
             property_name = _infer_property_from_instruments(instruments) or None
+            inferred_property = True
         property_aliases = batch_data.get("property_aliases") or build_property_aliases(property_name)
+        if inferred_property or any(_bad_property_candidate(a) for a in (property_aliases or [])):
+            property_aliases = build_property_aliases(property_name)
+
+        deposited_date = batch_data.get("deposited_date") or deposit_data.get("deposit_date") or batch_data.get("printed_on") or date.today().isoformat()
+        # For Chase deposit-ticket batches, the teller/deposit date should match the printed ticket
+        # date; OCR commonly flips 06/03 into 03/04 on handwritten rotated tickets.
+        if (deposit_data.get("source_system") == "Chase" or deposit_data.get("bank_name") == "Chase") and batch_data.get("printed_on"):
+            deposited_date = batch_data.get("printed_on")
 
         return BatchContext(
             batch_id=str(uuid.uuid4()),
@@ -864,7 +989,7 @@ class DocumentProcessor:
             property_name=property_name,
             property_aliases=property_aliases,
             property_address=batch_data.get("property_address"),
-            deposited_date=batch_data.get("deposited_date") or deposit_data.get("deposit_date") or batch_data.get("printed_on") or date.today().isoformat(),
+            deposited_date=deposited_date,
             deposit_transaction=batch_data.get("deposit_transaction") or deposit_data.get("deposit_transaction"),
             total_items=total_items,
             batch_amount=amount,
