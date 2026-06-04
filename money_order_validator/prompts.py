@@ -105,3 +105,33 @@ Do not extract individual money orders here. For Chase ATM/teller receipts, extr
 OCR context:
 {ocr_context}
 """.strip()
+
+REGISTER_ITEMS_PROMPT = """
+Extract the item/register rows from this bank deposit report or property-management batch table.
+Return JSON only:
+{
+  "items": [
+    {
+      "item_no": integer|null,
+      "routing_number": string|null,
+      "account_number": string|null,
+      "check_number": string|null,
+      "serial_number": string|null,
+      "instrument_type": "Check|MoneyOrder|null",
+      "payment_description": "Payment-Check|Payment-MoneyOrder|null",
+      "amount_numeric": number|null
+    }
+  ]
+}
+Rules:
+- Extract only real table rows, not header totals.
+- For Regions reports, rows are under columns like Capture Seq., R/T, Account Number, Check Number, Post Amount, Credit Amount.
+- Use Post Amount as amount_numeric.
+- For personal/business checks, serial_number is the check number.
+- For money orders, serial_number is the long check/MO number when shown.
+- Do not duplicate rows from continued summary pages that do not show item rows.
+- Return [] if no individual item rows are visible.
+
+OCR context:
+{ocr_context}
+""".strip()

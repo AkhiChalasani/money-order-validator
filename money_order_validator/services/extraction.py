@@ -11,6 +11,7 @@ from money_order_validator.prompts import (
     DEPOSIT_SLIP_PROMPT,
     INSTRUMENT_EXTRACTION_PROMPT,
     LLM_SYSTEM_MSG,
+    REGISTER_ITEMS_PROMPT,
 )
 from money_order_validator.schemas import TokenUsage
 from money_order_validator.services.image_utils import crop_to_content
@@ -19,6 +20,7 @@ from money_order_validator.services.page_classifier import PageKind
 from money_order_validator.services.regex_parsers import (
     parse_batch_header,
     parse_basic_instrument_from_ocr,
+    parse_batch_line_items,
     parse_deposit_info,
     sanitize_instrument,
 )
@@ -47,7 +49,7 @@ class VisionExtractor:
             if fallback and fallback.get("serial_number") and fallback.get("amount_numeric"):
                 return [fallback], TokenUsage(), False
 
-        prompt = INSTRUMENT_EXTRACTION_PROMPT.format(ocr_context=ocr_context or "(no OCR text available)")
+        prompt = INSTRUMENT_EXTRACTION_PROMPT.replace("{ocr_context}", ocr_context or "(no OCR text available)")
         width = settings.report_image_width if page_kind == PageKind.REPORT_WITH_INSTRUMENTS else settings.max_image_width
         img = crop_to_content(image)
         raw, usage = await llm_client.json_vision(
@@ -92,7 +94,7 @@ class VisionExtractor:
         enough = bool(parsed.get("batch_number") or parsed.get("batch_amount") or parsed.get("total_items"))
         if enough or not llm_client.available:
             return parsed, TokenUsage(), False
-        prompt = BATCH_HEADER_PROMPT.format(ocr_context=compact_ocr_context(ocr_text, max_chars=4000) or "(no OCR text available)")
+        prompt = BATCH_HEADER_PROMPT.replace("{ocr_context}", compact_ocr_context(ocr_text, max_chars=4000) or "(no OCR text available)")
         raw, usage = await llm_client.json_vision(
             system_prompt=LLM_SYSTEM_MSG,
             user_prompt=prompt,
@@ -113,7 +115,7 @@ class VisionExtractor:
         enough = bool(parsed.get("deposit_amount") or parsed.get("deposit_total") or parsed.get("check_total"))
         if enough or not llm_client.available:
             return parsed, TokenUsage(), False
-        prompt = DEPOSIT_SLIP_PROMPT.format(ocr_context=compact_ocr_context(ocr_text, max_chars=4000) or "(no OCR text available)")
+        prompt = DEPOSIT_SLIP_PROMPT.replace("{ocr_context}", compact_ocr_context(ocr_text, max_chars=4000) or "(no OCR text available)")
         raw, usage = await llm_client.json_vision(
             system_prompt=LLM_SYSTEM_MSG,
             user_prompt=prompt,
@@ -128,6 +130,52 @@ class VisionExtractor:
                 if v not in (None, "", []):
                     merged[k] = v
         return merged, usage, True
+
+    async def extract_register_items(self, image: Image.Image, ocr_text: str) -> Tuple[List[Dict[str, Any]], TokenUsage, bool]:
+        """Extract bank/property register rows from a deposit report page.
+
+        Focused fallback for when Azure OCR does not preserve table rows well enough for
+        regex parsing. Intentionally separate from instrument vision.
+        """
+        parsed = parse_batch_line_items(ocr_text)
+        if parsed or not llm_client.available:
+            return parsed, TokenUsage(), False
+        prompt = REGISTER_ITEMS_PROMPT.format(ocr_context=compact_ocr_context(ocr_text, max_chars=4000) or "(no OCR text available)")
+        raw, usage = await llm_client.json_vision(
+            system_prompt=LLM_SYSTEM_MSG,
+            user_prompt=prompt,
+            image=crop_to_content(image),
+            max_width=settings.report_image_width,
+            detail="high",
+            max_completion_tokens=2500,
+        )
+        items_raw = raw.get("items") if isinstance(raw, dict) else None
+        if not isinstance(items_raw, list):
+            return [], usage, True
+        items: List[Dict[str, Any]] = []
+        for idx, item in enumerate(items_raw, start=1):
+            if not isinstance(item, dict):
+                continue
+            amount = item.get("amount_numeric")
+            serial = item.get("serial_number") or item.get("check_number")
+            if amount in (None, "") or serial in (None, ""):
+                continue
+            inst_type = item.get("instrument_type") or ("MoneyOrder" if len(str(serial).lstrip("0")) >= 7 else "Check")
+            if inst_type not in {"Check", "MoneyOrder", "CashiersCheck", "Escrow"}:
+                inst_type = "MoneyOrder" if len(str(serial).lstrip("0")) >= 7 else "Check"
+            row = {
+                "item_no": item.get("item_no") or idx,
+                "routing_number": item.get("routing_number"),
+                "account_number": item.get("account_number"),
+                "check_number": item.get("check_number") or serial,
+                "serial_number": serial,
+                "amount_numeric": amount,
+                "instrument_type": inst_type,
+                "payment_description": item.get("payment_description") or ("Payment-MoneyOrder" if inst_type == "MoneyOrder" else "Payment-Check"),
+                "source": "vision_register_items",
+            }
+            items.append(row)
+        return items, usage, True
 
 
 vision_extractor = VisionExtractor()

@@ -213,13 +213,18 @@ def _parse_cardinal_words(value: str) -> Optional[int]:
 def parse_amount_from_words(text: Optional[str]) -> Optional[float]:
     """Parse written check/MO amounts.
 
-    Separates dollar segment from cents segment so word-cents do not inflate the dollar total.
-    Example: "TWO HUNDRED EIGHTY-EIGHT DOLLARS AND EIGHTY-THREE CENTS" -> 288.83, not 371.00.
+    Separates the dollar segment from the cents segment so cents are not counted
+    as extra dollars. Handles common handwritten/OCR variants:
+      - "FOURTEEN HUNDRED NINETY NINE 74" -> 1499.74
+      - "TWO HUNDRED SIX AND 17 DOLLARS" -> 206.17
+      - "THIRTEEN HUNDRED TWENTY THREE DOLLARS 74/XX" -> 1323.74
     """
     if not text:
         return None
     t = str(text).upper()
     t = t.replace("NO/100", "00/100")
+    # OCR sometimes reads /100 as /XX on handwritten checks.
+    t = re.sub(r"/\s*(?:XX|X{2})\b", "/100", t, flags=re.IGNORECASE)
     t = re.sub(r"[^A-Z0-9/ .'-]", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
     if not t:
@@ -228,35 +233,48 @@ def parse_amount_from_words(text: Optional[str]) -> Optional[float]:
     cents = 0
     dollar_part = t
 
-    # Numeric cents: 04/100, 09 CENTS, 9 CENTS.
+    # Numeric cents: 04/100, 74/XX->74/100, 09 CENTS, 9 CENTS.
     m = re.search(r"\b(\d{1,2})\s*/\s*100\b", t)
     if m:
         cents = int(m.group(1))
         dollar_part = t[:m.start()]
     else:
-        m = re.search(r"\b(\d{1,2})\s+CENTS?\b", t)
+        # Handwriting/OCR: "Two Hundred Six and 17 Dollars" — cents before DOLLARS label.
+        m = re.search(r"\bAND\s+(\d{1,2})\s+DOLLARS?\b", t)
         if m:
             cents = int(m.group(1))
             dollar_part = t[:m.start()]
-        elif re.search(r"\bCENTS?\b", t):
-            cents_head = t[: re.search(r"\bCENTS?\b", t).start()]
-            m_words = re.search(r"\bDOLLARS?\b\s*(?:AND\s+)?([A-Z -]+)$", cents_head)
-            if m_words:
-                cents_words = m_words.group(1).strip()
-                dollar_part = cents_head[: m_words.start()]
-            else:
-                m_words = re.search(r"\bAND\s+([A-Z -]+)$", cents_head)
+        else:
+            m = re.search(r"\b(\d{1,2})\s+CENTS?\b", t)
+            if m:
+                cents = int(m.group(1))
+                dollar_part = t[:m.start()]
+            elif re.search(r"\bCENTS?\b", t):
+                cents_head = t[: re.search(r"\bCENTS?\b", t).start()]
+                m_words = re.search(r"\bDOLLARS?\b\s*(?:AND\s+)?([A-Z -]+)$", cents_head)
                 if m_words:
                     cents_words = m_words.group(1).strip()
                     dollar_part = cents_head[: m_words.start()]
                 else:
-                    cents_words = cents_head.strip()
-                    dollar_part = ""
-            if re.fullmatch(r"(?:NO|ZERO|00)", cents_words.strip()):
-                cents = 0
+                    m_words = re.search(r"\bAND\s+([A-Z -]+)$", cents_head)
+                    if m_words:
+                        cents_words = m_words.group(1).strip()
+                        dollar_part = cents_head[: m_words.start()]
+                    else:
+                        cents_words = cents_head.strip()
+                        dollar_part = ""
+                if re.fullmatch(r"(?:NO|ZERO|00)", cents_words.strip()):
+                    cents = 0
+                else:
+                    parsed_cents = _parse_cardinal_words(cents_words)
+                    cents = parsed_cents if parsed_cents is not None else 0
             else:
-                parsed_cents = _parse_cardinal_words(cents_words)
-                cents = parsed_cents if parsed_cents is not None else 0
+                # Bare trailing two-digit cents with no DOLLARS marker, e.g.
+                # "FOURTEEN HUNDRED NINETY NINE 74".
+                m = re.search(r"\b(?:AND\s+)?(\d{1,2})\s*$", t)
+                if m and re.search(r"[A-Z]", t[:m.start()]):
+                    cents = int(m.group(1))
+                    dollar_part = t[:m.start()]
 
     m_dollars = re.search(r"\bDOLLARS?\b", dollar_part)
     if m_dollars:

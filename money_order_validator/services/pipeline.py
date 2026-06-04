@@ -160,9 +160,47 @@ def _deposit_key(row: Dict[str, Any]) -> Tuple[Any, ...]:
     acct = _clean_account(row.get("deposit_account") or row.get("account_last4"))
     date_value = row.get("deposit_date")
     item_count = row.get("item_count")
-    if tx or acct or date_value:
-        return (tx or "", acct or "", date_value or "", amount, item_count or "")
+    source = (row.get("source_system") or row.get("bank_name") or "").upper()
+    # Strong key for exact duplicate receipt pages.
+    if tx and (acct or date_value):
+        return ("tx", source, tx, acct or "", date_value or "", amount, item_count or "")
+    # Report continuation pages (e.g. Regions "Page 2 of 2") repeat the same deposit
+    # total/item count without the table. Treat same account/date/amount/count as the
+    # same deposit even when one page has a transaction number and the other does not.
+    if acct or date_value:
+        return ("deposit", source, acct or "", date_value or "", amount, item_count or "")
+    # Deposit tickets often have no transaction/account/date; use page number as last-resort key.
     return ("page", row.get("page_number"), amount, item_count or "")
+
+
+def _same_deposit_slip(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    """Return True when two parsed rows describe the same physical/logical deposit."""
+    amount_a = _deposit_amount_value(a)
+    amount_b = _deposit_amount_value(b)
+    if amount_a is None or amount_b is None or abs(amount_a - amount_b) >= 0.005:
+        return False
+    acct_a = _clean_account(a.get("deposit_account") or a.get("account_last4"))
+    acct_b = _clean_account(b.get("deposit_account") or b.get("account_last4"))
+    date_a = a.get("deposit_date")
+    date_b = b.get("deposit_date")
+    count_a = a.get("item_count")
+    count_b = b.get("item_count")
+    source_a = (a.get("source_system") or a.get("bank_name") or "").upper()
+    source_b = (b.get("source_system") or b.get("bank_name") or "").upper()
+    if source_a and source_b and source_a != source_b:
+        return False
+    if acct_a and acct_b and acct_a != acct_b:
+        return False
+    if date_a and date_b and date_a != date_b:
+        return False
+    if count_a is not None and count_b is not None:
+        try:
+            if int(count_a) != int(count_b):
+                return False
+        except (TypeError, ValueError):
+            return False
+    # Require at least one stable identity besides amount so unrelated same-value slips remain distinct.
+    return bool((acct_a and acct_b) or (date_a and date_b) or (count_a is not None and count_b is not None))
 
 
 def _is_meaningful_deposit(row: Dict[str, Any]) -> bool:
@@ -178,8 +216,16 @@ def _add_deposit_slip(slips: List[Dict[str, Any]], patch: Dict[str, Any], page_n
     row.setdefault("page_number", page_number)
     key = _deposit_key(row)
     for existing in slips:
-        if _deposit_key(existing) == key:
+        if _deposit_key(existing) == key or _same_deposit_slip(existing, row):
+            prior_page = existing.get("page_number")
             _merge_non_empty(existing, row)
+            pages = existing.setdefault("source_pages", [])
+            if prior_page and prior_page not in pages:
+                pages.append(prior_page)
+            if page_number not in pages:
+                pages.append(page_number)
+            if pages:
+                existing["page_number"] = min(pages)
             return
     slips.append(row)
 
@@ -215,6 +261,23 @@ def _aggregate_deposit_slips(slips: List[Dict[str, Any]]) -> Dict[str, Any]:
     out["deposit_slip_count"] = len(slips)
     out["deposit_slips"] = slips
     return out
+
+
+def _should_extract_register_with_vision(kind: PageKind, ocr_text: str, page_deposit: Dict[str, Any]) -> bool:
+    """Use focused register vision only for likely table/report pages."""
+    t = (ocr_text or "").upper()
+    if kind not in {PageKind.DEPOSIT_REPORT, PageKind.DEPOSIT_SLIP, PageKind.BATCH_HEADER}:
+        return False
+    if page_deposit.get("source_system") == "Regions" and not re.search(r"\(\s*CONTINUED\s*\)|PAGE\s+2\s+OF\s+2", t):
+        return True
+    return bool(
+        re.search(
+            r"CAPTURE\s+SEQ|CHECK\s+NUMBER|POST\s+AMOUNT|TRANSACTION\s+DETAIL\s+FOR\s+TRANSACTION|"
+            r"DEPOSIT\s+CONTROL\s+INFORMATION|PAYMENT[-\s]?MONEYORDER|PAYMENT[-\s]?CHECK",
+            t,
+            flags=re.IGNORECASE,
+        )
+    )
 
 
 def _bad_property_candidate(value: Optional[str]) -> bool:
@@ -366,6 +429,14 @@ class DocumentProcessor:
             if kind in {PageKind.BATCH_HEADER, PageKind.DEPOSIT_REPORT, PageKind.REPORT_WITH_INSTRUMENTS, PageKind.DEPOSIT_SLIP, PageKind.UNKNOWN, PageKind.RECEIPT}:
                 _merge_non_empty(batch_data, parse_batch_header(ocr_text))
                 new_items = parse_batch_line_items(ocr_text)
+                if not new_items and _should_extract_register_with_vision(kind, ocr_text, page_deposit):
+                    new_items, usage, used = await vision_extractor.extract_register_items(image, ocr_text)
+                    if used:
+                        llm_calls += 1
+                        self._accumulate_usage(usage_total, usage)
+                        phase_tokens["register"] += usage.total_tokens
+                        log_row["llm_used"] = True
+                        log_row["register_vision_used"] = True
                 if new_items:
                     register_items.extend(new_items)
 
