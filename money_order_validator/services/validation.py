@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+import re
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
@@ -40,6 +41,60 @@ def compute_ocr_confidence(raw: Dict[str, Any]) -> float:
         raw.get("issuer") or raw.get("micr_line"),
     ]
     return round(sum(1 for x in fields if x not in (None, "", [])) / len(fields), 2)
+
+
+def _compact_name(value: Optional[str]) -> str:
+    return re.sub(r"[^A-Z0-9]", "", (value or "").upper())
+
+
+def _property_aliases(property_name: Optional[str]) -> List[str]:
+    if not property_name:
+        return []
+    aliases = {property_name.strip()}
+    raw = property_name.strip()
+
+    m = re.search(r"\bdba\b\s+(.+)$", raw, flags=re.IGNORECASE)
+    if m:
+        aliases.add(m.group(1).strip())
+
+    for value in list(aliases):
+        cleaned = re.sub(r"\b(?:LLC|LP|L\.P\.|LTD|INC|LIMITED|PARTNERSHIP)\b", " ", value, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,-.")
+        if cleaned:
+            aliases.add(cleaned)
+        # Many reports use account names like "Arella Forest in Woodland" while
+        # tenants write only "Arella" or "Arella Forest" on the payee line.
+        for sep in (" in ", " at ", " dba "):
+            if sep in value.lower():
+                head = re.split(sep, value, flags=re.IGNORECASE)[0].strip(" ,-.")
+                tail = re.split(sep, value, flags=re.IGNORECASE)[-1].strip(" ,-.")
+                if head:
+                    aliases.add(head)
+                if tail and len(tail.split()) > 1:
+                    aliases.add(tail)
+
+    return [a for a in aliases if a]
+
+
+def _payee_match_score(payee: Optional[str], property_name: Optional[str], extra_aliases: Optional[List[str]] = None) -> float:
+    if not payee or not property_name:
+        return 0.0
+    aliases = _property_aliases(property_name)
+    for alias in (extra_aliases or []):
+        if alias and alias not in aliases:
+            aliases.append(alias)
+    scores = [similarity(payee, alias) for alias in aliases]
+    payee_c = _compact_name(payee)
+    for alias in aliases:
+        alias_c = _compact_name(alias)
+        if payee_c and alias_c and min(len(payee_c), len(alias_c)) >= 5:
+            if payee_c in alias_c or alias_c in payee_c:
+                scores.append(0.95)
+        for token in re.findall(r"[A-Za-z0-9]{5,}", alias):
+            token_score = similarity(payee, token)
+            if token_score >= 0.80:
+                scores.append(max(0.88, token_score))
+    return round(max(scores or [0.0]), 3)
 
 
 def validate_instruments(batch: BatchContext, instruments: List[Instrument]) -> None:
@@ -90,11 +145,11 @@ def validate_instruments(batch: BatchContext, instruments: List[Instrument]) -> 
             score += 0.12
             date_ok = False
 
-        payee_match_score = similarity(inst.payee_raw, batch.property_name) if batch.property_name else 0.0
+        payee_match_score = _payee_match_score(inst.payee_raw, batch.property_name, list(batch.property_aliases or [])) if batch.property_name else 0.0
         if batch.property_name and inst.payee_raw and payee_match_score < 0.62:
             flags.append("payee_mismatch")
             score += 0.20
-        elif batch.property_name and not inst.payee_raw:
+        elif batch.property_name and not inst.payee_raw and not inst.missing_from_scan:
             flags.append("missing_payee")
             score += 0.10
 

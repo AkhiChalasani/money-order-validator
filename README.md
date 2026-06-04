@@ -135,3 +135,15 @@ MAX_IMAGE_WIDTH=1024
 ```
 
 Use `batch.processing_stats` in the response to see token usage by phase.
+
+
+## Regions deposit report support
+
+For Regions `Details of Deposits by Account` PDFs, page 1/2 are bank register pages, not checks. The parser now:
+
+- classifies those pages as `deposit_report`, so they are not sent to instrument vision;
+- extracts `property_name`, `account_number`, `batch_amount`, `total_items`, deposit date, and deposit number from the report header;
+- extracts each `Capture Seq.` row as a register item;
+- reconciles visible instruments against the register by check/serial/MICR suffix;
+- corrects amount OCR/cents errors from the authoritative register amount;
+- emits unmatched register rows with `missing_from_scan=true`.

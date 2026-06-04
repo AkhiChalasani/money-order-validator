@@ -34,6 +34,37 @@ def classify_page(text: str) -> Tuple[PageKind, Dict[str, int]]:
     if len(words) < 6:
         return PageKind.BLANK, {"words": len(words)}
 
+    # Hard skip rules for back-side pages. Azure OCR often sees faint bleed-through from the
+    # front of a money order/check; these deterministic back signals should win unless there is
+    # a clearly visible front-face payment area.
+    hard_back_signals = sum(
+        1
+        for pat in (
+            r"\bLOAD\s+THIS\s+DIRECTION\b",
+            r"\bPURCHASER'?S\s+AGREEMENT\b",
+            r"\bSERVICE\s+CHARGE\b",
+            r"\bTERMS\s+AND\s+CONDITIONS\b",
+            r"\bPAYEE\s+ENDORSEMENT\b",
+            r"\bENDORSE\s+ABOVE\s+THIS\s+LINE\b",
+            r"\bDEPOSITORY\s+BANK\s+ENDORSEMENT\b",
+            r"\bDO\s+NOT\s+WRITE\s*/?\s*SIGN\s*/?\s*STAMP\s+BELOW\b",
+            r"\bFOR\s+DEPOSIT\s+ONLY\b",
+        )
+        if re.search(pat, t, flags=re.IGNORECASE)
+    )
+    strong_front_face = bool(
+        re.search(r"\bPAY\s+EXACTLY\b|\bPAY\s+ONLY\b", t)
+        and re.search(r"\bPAY\s+TO\s+THE\s+ORDER\b|\bPAY\s+TO\b", t)
+        and re.search(r"\$\s*\d{2,5}[,.]\d{2}\b", t)
+    )
+    check_back_only = bool(
+        re.search(r"\bFOR\s+DEPOSIT\s+ONLY\b", t)
+        and re.search(r"\bENDORSE|DEPOSITORY\s+BANK|DO\s+NOT\s+WRITE", t)
+        and not strong_front_face
+    )
+    if (hard_back_signals >= 2 and not strong_front_face) or check_back_only:
+        return PageKind.BACK, {"words": len(words), "hard_back_signals": hard_back_signals}
+
     # Scores are deliberately simple and explainable. Front-side instrument signals must beat
     # legal/back-side disclosure signals to avoid extracting bleed-through from back pages.
     front = 0
@@ -65,7 +96,10 @@ def classify_page(text: str) -> Tuple[PageKind, Dict[str, int]]:
 
     deposit = 0
     deposit += 5 * _count(r"\bTRANSACTION\s+DETAIL\s+FOR\s+TRANSACTION\b|\bDEPOSIT\s+CONTROL\s+INFORMATION\b", t)
+    deposit += 5 * _count(r"\bDETAILS\s+OF\s+DEPOSITS\s+BY\s+ACCOUNT\b|\bTOTAL\s+OF\s+DEPOSITS\s+SUBMITTED\b", t)
     deposit += 4 * _count(r"\bDEPOSIT\s+ACCOUNT\b|\bDEPOSIT\s+TOTAL\b|\bCHECKS?\s+TOTAL\b", t)
+    deposit += 4 * _count(r"\bTOTAL\s+NUMBER\s+OF\s+ITEMS\b|\bACCOUNT\s+NAME/NUMBER\b", t)
+    deposit += 3 * _count(r"\bCAPTURE\s+SEQ\b|\bPOST\s+AMOUNT\b|\bCREDIT\s+AMOUNT\b|\bDEPOSIT\s+NUMBER\b", t)
     deposit += 2 * _count(r"\bCREDIT\s+TOTAL\b|\bDEBIT\s+TOTAL\b|\bITEM\s+COUNT\b", t)
     deposit += 2 * _count(r"\bDEPOSIT\s+SLIP\b|\bDEPOSIT\s+TICKET\b", t)
 
@@ -83,12 +117,15 @@ def classify_page(text: str) -> Tuple[PageKind, Dict[str, int]]:
         "receipt": receipt,
     }
 
+    if deposit >= 8 and front < 9:
+        return PageKind.DEPOSIT_SLIP, scores
+
     if front >= 6:
         if deposit >= 5 or batch >= 5:
             return PageKind.REPORT_WITH_INSTRUMENTS, scores
         return PageKind.INSTRUMENT, scores
 
-    if back >= 5 and front < 6:
+    if back >= 5 and front < 8:
         return PageKind.BACK, scores
 
     if receipt >= 4 and front < 4:

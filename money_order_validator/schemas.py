@@ -15,6 +15,7 @@ class BatchContext(BaseModel):
     bank_name: Optional[str] = None
     account_number: Optional[str] = None
     property_name: Optional[str] = None
+    property_aliases: List[str] = Field(default_factory=list)
     property_address: Optional[str] = None
     deposited_date: Optional[str] = None
     deposit_transaction: Optional[str] = None
@@ -67,7 +68,11 @@ class ValidationResult(BaseModel):
     file_name: Optional[str] = None
     batch: BatchContext
     instruments: List[Instrument]
+    # Legacy aggregate object. When a PDF contains multiple physical slips/receipts, this
+    # contains summed totals and also includes a nested deposit_slips array.
     deposit_slip: Optional[Dict[str, Any]] = None
+    # Convenience top-level list for clients that need each physical slip separately.
+    deposit_slips: Optional[List[Dict[str, Any]]] = None
     pages: Optional[List[Dict[str, Any]]] = None
 
 
