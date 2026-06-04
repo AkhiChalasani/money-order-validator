@@ -1,0 +1,166 @@
+from __future__ import annotations
+
+from collections import Counter, defaultdict
+from datetime import date, datetime
+from typing import Any, Dict, List, Optional
+
+from money_order_validator.schemas import BatchContext, Instrument
+from money_order_validator.services.regex_parsers import similarity
+
+STANDARD_ISSUERS = {
+    "Western Union",
+    "MoneyGram",
+    "PLS",
+    "DolEx",
+    "Intermex",
+    "Fidelity Express",
+    "JPMorgan Chase",
+    "Wells Fargo",
+    "Comerica Bank",
+    "Prosperity Bank",
+    None,
+}
+
+
+def _parse_iso_date(value: Optional[str]) -> Optional[date]:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def compute_ocr_confidence(raw: Dict[str, Any]) -> float:
+    fields = [
+        raw.get("serial_number"),
+        raw.get("amount_numeric"),
+        raw.get("issue_date"),
+        raw.get("payee_raw"),
+        raw.get("issuer") or raw.get("micr_line"),
+    ]
+    return round(sum(1 for x in fields if x not in (None, "", [])) / len(fields), 2)
+
+
+def validate_instruments(batch: BatchContext, instruments: List[Instrument]) -> None:
+    serials = [i.serial_number for i in instruments if i.serial_number]
+    serial_counts = Counter(serials)
+
+    split_groups: Dict[tuple, List[Instrument]] = defaultdict(list)
+    for inst in instruments:
+        if inst.unit and inst.issue_date:
+            split_groups[(inst.unit, inst.issue_date)].append(inst)
+
+    items_valid = items_review = items_invalid = items_flagged = 0
+    today = date.today()
+
+    for inst in instruments:
+        flags: List[str] = []
+        score = 0.0
+
+        if inst.missing_from_scan:
+            flags.append("missing_physical_instrument - present in batch/register but no matching scan was extracted")
+            score += 0.35
+
+        if not inst.serial_number:
+            flags.append("missing_serial_number")
+            score += 0.20
+
+        if inst.amount_numeric is None:
+            flags.append("missing_amount")
+            score += 0.30
+        elif inst.amount_numeric >= 1000:
+            flags.append(f"high_value - ${inst.amount_numeric:,.2f} at or above review threshold")
+            score += 0.10
+
+        if inst.serial_number and serial_counts[inst.serial_number] > 1 and not inst.missing_from_scan:
+            flags.append("duplicate_serial_number")
+            score += 0.35
+
+        dt = _parse_iso_date(inst.issue_date)
+        date_ok = True
+        if dt:
+            age = abs((today - dt).days)
+            date_ok = age <= 120
+            if not date_ok:
+                flags.append("date_outside_120_days")
+                score += 0.15
+        else:
+            flags.append("missing_issue_date")
+            score += 0.12
+            date_ok = False
+
+        payee_match_score = similarity(inst.payee_raw, batch.property_name) if batch.property_name else 0.0
+        if batch.property_name and inst.payee_raw and payee_match_score < 0.62:
+            flags.append("payee_mismatch")
+            score += 0.20
+        elif batch.property_name and not inst.payee_raw:
+            flags.append("missing_payee")
+            score += 0.10
+
+        if inst.issuer not in STANDARD_ISSUERS:
+            flags.append("non_standard_issuer")
+            score += 0.10
+
+        if inst.mobile_deposit_prohibited:
+            flags.append("mobile_deposit_prohibited - physical deposit required")
+
+        grouped = split_groups.get((inst.unit, inst.issue_date), []) if inst.unit and inst.issue_date else []
+        if len(grouped) >= 3:
+            flags.append("split_payment_group - three or more instruments same unit/date")
+            score += 0.05
+
+        status = "VALID"
+        if score >= 0.60 or inst.amount_numeric is None:
+            status = "INVALID"
+            items_invalid += 1
+        elif score >= 0.18 or flags:
+            status = "REVIEW"
+            items_review += 1
+        else:
+            items_valid += 1
+        if flags:
+            items_flagged += 1
+
+        inst.validation = {
+            "overall_status": status,
+            "risk_score": round(min(score, 1.0), 3),
+            "payee_match_score": payee_match_score,
+            "date_within_120_days": date_ok,
+            "serial_duplicate": bool(inst.serial_number and serial_counts[inst.serial_number] > 1),
+            "fraud_check": {"status": "PASS" if status != "INVALID" else "FAIL", "findings": flags},
+            "flags": flags,
+        }
+
+    avg = round(sum(i.validation.get("risk_score", 0) for i in instruments) / max(1, len(instruments)), 3)
+    overall = "ACCEPT"
+    if items_invalid > 0:
+        overall = "REJECT"
+    elif items_review > 0 or items_flagged > 0:
+        overall = "REVIEW"
+
+    split_summary = []
+    for (unit, issue_date), group in split_groups.items():
+        if len(group) >= 3:
+            split_summary.append(
+                {
+                    "unit": unit,
+                    "date": issue_date,
+                    "item_nos": [g.item_no for g in group],
+                    "total": round(sum(g.amount_numeric or 0 for g in group), 2),
+                    "note": f"{len(group)} instruments same unit/date - possible split payment",
+                }
+            )
+
+    duplicate_serials = sorted([s for s, c in serial_counts.items() if c > 1])
+    batch.risk_summary = {
+        "average_risk_score": avg,
+        "overall_decision": overall,
+        "items_valid": items_valid,
+        "items_review": items_review,
+        "items_invalid": items_invalid,
+        "items_flagged": items_flagged,
+        "split_payment_groups": split_summary,
+        "duplicate_serials": duplicate_serials,
+    }
+    batch.overall_decision = overall
