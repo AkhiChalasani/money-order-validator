@@ -461,6 +461,89 @@ def _low_evidence_form_or_back_row(row: Dict[str, Any]) -> bool:
     )
 
 
+def _raw_confidence(row: Dict[str, Any]) -> float:
+    fields = [
+        row.get("serial_number"),
+        row.get("amount_numeric"),
+        row.get("issue_date"),
+        row.get("payee_raw"),
+        row.get("issuer") or row.get("micr_line"),
+    ]
+    return sum(1 for x in fields if x not in (None, "", [])) / max(1, len(fields))
+
+
+def _looks_visually_unclear(row: Dict[str, Any]) -> bool:
+    """Mark weak extractions for REVIEW instead of pretending they are exact.
+
+    Conservative: does not delete the item, just forces manual review when the image
+    or extraction evidence is weak (sideways/faint scans like upside-down MoneyGrams).
+    """
+    if row.get("missing_from_scan"):
+        return False
+    if row.get("image_quality") == "unclear":
+        return True
+
+    confidence = _raw_confidence(row)
+    has_serial = bool(normalize_serial(row.get("serial_number")) or row.get("micr_line"))
+    has_amount = _as_float(row.get("amount_numeric")) is not None or bool(row.get("amount_words"))
+    has_payee = bool(normalize_payee(row.get("payee_raw")))
+    has_date = bool(row.get("issue_date"))
+    has_words = bool(str(row.get("amount_words") or "").strip())
+    inst_type = str(row.get("instrument_type") or "").lower()
+    ocr_text = str(row.get("_ocr_text") or "")
+
+    if confidence < 0.65:
+        return True
+    if not has_serial and not has_amount:
+        return True
+    if inst_type in {"moneyorder", "money_order"} and not has_words and (not has_payee or not has_date):
+        return True
+    # Sideways/faint scans often produce impossible or suspicious dates.
+    issue_date = str(row.get("issue_date") or "")
+    if re.match(r"^(20[3-9][0-9]|19[0-9]{2})-", issue_date):
+        return True
+    if re.search(r"QUICKDEPOSIT|DEPOSIT\s+ACTIVITY|WE\s+FOUND\s+\d+\s+DEPOSIT\s+ITEMS", ocr_text, re.I):
+        return True
+    return False
+
+
+def _mark_unclear_instruments(rows: List[Dict[str, Any]], batch_data: Dict[str, Any], deposit_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Apply review-only image quality flags and cap over-extraction for unclear duplicates.
+
+    When the bank/deposit register says there are N items but vision emits more than N
+    rows, keep the strongest N rows and mark weak rows as unclear before validation.
+    """
+    try:
+        total_items = int(batch_data.get("total_items") or deposit_data.get("item_count") or 0)
+    except (TypeError, ValueError):
+        total_items = 0
+
+    for row in rows:
+        if _looks_visually_unclear(row):
+            row["image_quality"] = "unclear"
+            row.setdefault("review_flags", [])
+            for flag in ("unclear_instrument_image", "low_confidence_extraction", "manual_review_required"):
+                if flag not in row["review_flags"]:
+                    row["review_flags"].append(flag)
+
+    if total_items > 0 and len(rows) > total_items:
+        def rank(row: Dict[str, Any]) -> Tuple[int, int, int]:
+            clear_score = 0 if row.get("image_quality") == "unclear" else 1
+            return (clear_score, DocumentProcessor._instrument_quality_score(row), -int(row.get("page_number") or 999999))
+
+        kept = sorted(rows, key=rank, reverse=True)[:total_items]
+        kept_ids = {id(r) for r in kept}
+        dropped = [r for r in rows if id(r) not in kept_ids]
+        for row in kept:
+            if dropped:
+                row.setdefault("batch_review_notes", [])
+                note = f"vision_extracted_{len(rows)}_rows_but_deposit_register_count_is_{total_items}; weakest_rows_suppressed"
+                if note not in row["batch_review_notes"]:
+                    row["batch_review_notes"].append(note)
+        rows = sorted(kept, key=lambda r: (r.get("page_number") or 999999, r.get("_page_item_index") or 0))
+    return rows
+
+
 def _correct_deposit_slips_from_following_instruments(slips: List[Dict[str, Any]], instruments: List[Dict[str, Any]]) -> None:
     """Use the actual following physical instruments to correct handwritten Chase slip totals.
 
@@ -697,6 +780,7 @@ class DocumentProcessor:
         _correct_deposit_slips_from_following_instruments(deposit_slips, raw_instruments)
         non_sequence_register_items = [i for i in register_items if i.get("source") != "deposit_ticket_sequence"]
         raw_instruments = self._reconcile_register_items(raw_instruments, non_sequence_register_items)
+        raw_instruments = _mark_unclear_instruments(raw_instruments, batch_data, deposit_data)
         aggregate_deposit = _aggregate_deposit_slips(deposit_slips)
         if aggregate_deposit:
             deposit_data = {**deposit_data, **aggregate_deposit}
@@ -784,6 +868,24 @@ class DocumentProcessor:
         return out
 
     @staticmethod
+    @staticmethod
+    def _instrument_quality_score(row: Dict[str, Any]) -> int:
+        """Integer quality rank used to select the best rows when over-extraction occurs."""
+        score = 0
+        if normalize_serial(row.get("serial_number")):
+            score += 3
+        if _as_float(row.get("amount_numeric")) is not None:
+            score += 2
+        if row.get("amount_words"):
+            score += 2
+        if normalize_payee(row.get("payee_raw")):
+            score += 1
+        if row.get("issue_date"):
+            score += 1
+        if row.get("micr_line"):
+            score += 1
+        return score
+
     def _drop_form_and_back_artifacts(rows: List[Dict[str, Any]], deposit_slips: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Remove pseudo instruments created from deposit tickets and adjacent back pages."""
         deposit_pages = {
@@ -1105,6 +1207,7 @@ class DocumentProcessor:
                 missing_from_scan=bool(raw.get("missing_from_scan")),
                 page_number=raw.get("page_number"),
                 source_file=file_name,
+                image_quality=raw.get("image_quality"),
             )
             instruments.append(inst)
         return instruments

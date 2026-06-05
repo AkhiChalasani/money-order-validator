@@ -61,6 +61,7 @@ class Instrument(BaseModel):
     missing_from_scan: bool = False
     page_number: Optional[int] = None
     source_file: Optional[str] = None
+    image_quality: Optional[str] = None
     validation: Dict[str, Any] = Field(default_factory=dict)
 
 
