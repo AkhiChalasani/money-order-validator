@@ -1099,8 +1099,13 @@ class DocumentProcessor:
                 page_logs.append(log_row)
                 continue
 
-            should_extract = False if page_is_deposit_detail_report else (kind == PageKind.INSTRUMENT or kind == PageKind.REPORT_WITH_INSTRUMENTS)
-            if kind == PageKind.UNKNOWN and not page_is_deposit_detail_report:
+            # Deposit ticket pages carry handwritten line items that vision mistakes for
+            # instrument fronts. Extracting them creates duplicate instruments alongside
+            # the real physical scans. The authoritative amounts come from the register
+            # rows already in register_items; instrument vision must not run here.
+            page_is_deposit_ticket = _page_has_deposit_ticket(ocr_text, page_deposit)
+            should_extract = False if (page_is_deposit_detail_report or page_is_deposit_ticket) else (kind == PageKind.INSTRUMENT or kind == PageKind.REPORT_WITH_INSTRUMENTS)
+            if kind == PageKind.UNKNOWN and not page_is_deposit_detail_report and not page_is_deposit_ticket:
                 should_extract = _should_try_unknown_vision(ocr_text)
             if should_extract:
                 instruments, usage, used = await vision_extractor.extract_instruments(image, ocr_text, kind, page_angle=page_angle)
@@ -1156,6 +1161,12 @@ class DocumentProcessor:
         # Unmatched sequence rows are emitted as REVIEW placeholders instead of
         # disappearing; this prevents long batches from truncating.
         raw_instruments = self._reconcile_register_items(raw_instruments, register_items)
+        # Use the sum of per-slip item_counts as the authoritative total BEFORE capping.
+        # batch_data["total_items"] only reflects the last deposit ticket page parsed
+        # (e.g. 17 for the third slip in batch 21 instead of 42 = 8+17+17).
+        slip_item_sum = sum(int(s.get("item_count") or 0) for s in deposit_slips if s.get("item_count") is not None)
+        if slip_item_sum:
+            batch_data["total_items"] = slip_item_sum
         raw_instruments = _mark_unclear_instruments(raw_instruments, batch_data, deposit_data)
         deposit_slips = _dedupe_logical_deposits(deposit_slips)
         aggregate_deposit = _aggregate_deposit_slips(deposit_slips)
