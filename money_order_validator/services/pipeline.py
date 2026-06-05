@@ -603,7 +603,12 @@ class DocumentProcessor:
                     log_row["deposit_vision_used"] = True
 
             if _page_has_deposit_ticket(ocr_text, page_deposit) and (page_deposit.get("item_count") or kind in {PageKind.DEPOSIT_SLIP, PageKind.DEPOSIT_REPORT, PageKind.REPORT_WITH_INSTRUMENTS, PageKind.UNKNOWN}):
-                seq_items, usage, used = await vision_extractor.extract_deposit_ticket_items(image, ocr_text)
+                seq_items, usage, used = await vision_extractor.extract_deposit_ticket_items(
+                    image,
+                    ocr_text,
+                    expected_count=int(page_deposit.get("item_count") or 0) or None,
+                    expected_total=_deposit_amount_value(page_deposit),
+                )
                 if used:
                     llm_calls += 1
                     self._accumulate_usage(usage_total, usage)

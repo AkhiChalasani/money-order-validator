@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from PIL import Image
 
@@ -132,47 +132,118 @@ class VisionExtractor:
                     merged[k] = v
         return merged, usage, True
 
-    async def extract_deposit_ticket_items(self, image: Image.Image, ocr_text: str) -> Tuple[List[Dict[str, Any]], TokenUsage, bool]:
+    async def extract_deposit_ticket_items(
+        self,
+        image: Image.Image,
+        ocr_text: str,
+        expected_count: Optional[int] = None,
+        expected_total: Optional[float] = None,
+    ) -> Tuple[List[Dict[str, Any]], TokenUsage, bool]:
         """Extract handwritten deposit-ticket row amounts.
 
-        Used only as an ordered reconciliation source for the instruments scanned
-        after the slip. Not emitted as standalone missing-from-scan rows.
+        Chase deposit tickets are frequently scanned sideways or upside down. A
+        single vision pass can read the table total but misread several line
+        amounts. This method tries the native orientation first, then rotated
+        copies when the row count/total does not look trustworthy, and selects
+        the most internally consistent candidate.
         """
         if not llm_client.available:
             return [], TokenUsage(), False
-        prompt = DEPOSIT_TICKET_ITEMS_PROMPT.replace("{ocr_context}", compact_ocr_context(ocr_text, max_chars=3000) or "(no OCR text available)")
-        raw, usage = await llm_client.json_vision(
-            system_prompt=LLM_SYSTEM_MSG,
-            user_prompt=prompt,
-            image=crop_to_content(image),
-            max_width=settings.report_image_width,
-            detail="high",
-            max_completion_tokens=1600,
+
+        prompt = DEPOSIT_TICKET_ITEMS_PROMPT.replace(
+            "{ocr_context}", compact_ocr_context(ocr_text, max_chars=3000) or "(no OCR text available)"
         )
-        items_raw = raw.get("items") if isinstance(raw, dict) else None
-        if not isinstance(items_raw, list):
-            return [], usage, True
-        items: List[Dict[str, Any]] = []
-        for idx, item in enumerate(items_raw, start=1):
-            if not isinstance(item, dict):
-                continue
-            amount = item.get("amount_numeric")
-            try:
-                amount_f = round(float(str(amount).replace(",", "")), 2)
-            except (TypeError, ValueError):
-                continue
-            if amount_f <= 0:
-                continue
-            row = {
-                "item_no": item.get("item_no") or idx,
-                "unit": item.get("unit"),
-                "amount_numeric": amount_f,
-                "source": "deposit_ticket_sequence",
-                "payment_description": "Payment-MoneyOrder",
-                "instrument_type": "MoneyOrder",
-            }
-            items.append(row)
-        return items, usage, True
+
+        def _parse_items(raw: Dict[str, Any], orientation: int) -> List[Dict[str, Any]]:
+            items_raw = raw.get("items") if isinstance(raw, dict) else None
+            if not isinstance(items_raw, list):
+                return []
+            items: List[Dict[str, Any]] = []
+            for idx, item in enumerate(items_raw, start=1):
+                if not isinstance(item, dict):
+                    continue
+                amount = item.get("amount_numeric")
+                try:
+                    amount_f = round(float(str(amount).replace(",", "").replace("$", "")), 2)
+                except (TypeError, ValueError):
+                    continue
+                if amount_f <= 0:
+                    continue
+                # Deposit-ticket row amounts are individual payment amounts. Drop obvious
+                # copied totals or OCR garbage outside the normal MO/check range.
+                if amount_f > 5000:
+                    continue
+                row = {
+                    "item_no": item.get("item_no") or idx,
+                    "unit": item.get("unit"),
+                    "amount_numeric": amount_f,
+                    "source": "deposit_ticket_sequence",
+                    "payment_description": "Payment-MoneyOrder",
+                    "instrument_type": "MoneyOrder",
+                    "orientation_degrees": orientation,
+                }
+                items.append(row)
+            return items
+
+        def _candidate_score(items: List[Dict[str, Any]]) -> float:
+            if not items:
+                return -1_000_000.0
+            row_sum = round(sum(float(i.get("amount_numeric") or 0.0) for i in items), 2)
+            score = float(len(items)) * 100.0
+            if expected_count:
+                score -= abs(len(items) - int(expected_count)) * 500.0
+                if len(items) == int(expected_count):
+                    score += 1000.0
+            # Use the slip total only as a weak signal. Handwritten totals are often OCR'd
+            # with a missing leading digit, so a wrong expected_total must not force a bad
+            # line-item candidate to win.
+            if expected_total:
+                diff = abs(row_sum - float(expected_total))
+                if diff <= 1.0:
+                    score += 400.0
+                elif diff <= 250.0:
+                    score += 75.0
+                else:
+                    score -= min(diff, 1000.0) / 25.0
+            # If candidates have the same row count, prefer the larger positive sum. In these
+            # tickets the common OCR failure is dropping a leading digit or reading 442 as 400,
+            # not inventing extra dollars.
+            score += row_sum / 1000.0
+            return score
+
+        total_usage = TokenUsage()
+        candidates: List[Tuple[float, List[Dict[str, Any]]]] = []
+
+        async def _run_for_orientation(degrees: int) -> None:
+            img = image.rotate(degrees, expand=True) if degrees else image
+            raw, usage = await llm_client.json_vision(
+                system_prompt=LLM_SYSTEM_MSG,
+                user_prompt=prompt,
+                image=crop_to_content(img),
+                max_width=settings.report_image_width,
+                detail="high",
+                max_completion_tokens=1800,
+            )
+            total_usage.prompt_tokens += usage.prompt_tokens
+            total_usage.completion_tokens += usage.completion_tokens
+            total_usage.total_tokens += usage.total_tokens
+            items = _parse_items(raw, degrees)
+            candidates.append((_candidate_score(items), items))
+
+        await _run_for_orientation(0)
+        best_score, best_items = max(candidates, key=lambda c: c[0])
+        best_sum = round(sum(float(i.get("amount_numeric") or 0.0) for i in best_items), 2)
+        count_ok = bool(expected_count and len(best_items) == int(expected_count))
+        total_ok = bool(expected_total and abs(best_sum - float(expected_total)) <= 1.0)
+
+        # If native orientation does not match the ticket count/total, try rotated copies.
+        # 180 degrees fixes upside-down deposit tickets; 90/270 cover sideways camera scans.
+        if not (count_ok and (total_ok or not expected_total)):
+            for degrees in (180, 90, 270):
+                await _run_for_orientation(degrees)
+            best_score, best_items = max(candidates, key=lambda c: c[0])
+
+        return best_items, total_usage, True
 
     async def extract_register_items(self, image: Image.Image, ocr_text: str) -> Tuple[List[Dict[str, Any]], TokenUsage, bool]:
         """Extract bank/property register rows from a deposit report page.
