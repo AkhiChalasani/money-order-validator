@@ -24,7 +24,8 @@ class BatchContext(BaseModel):
     printed_on: Optional[str] = None
     source_system: Optional[str] = "YottaReal"
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-    gl_summary: List[Dict[str, Any]] = Field(default_factory=list)
+    # Internal accounting rollup. Hidden from public API output; clients should use batch_amount/deposit_slip.
+    gl_summary: List[Dict[str, Any]] = Field(default_factory=list, exclude=True)
     overall_decision: Optional[Literal["ACCEPT", "REVIEW", "REJECT"]] = None
     processing_stats: Dict[str, Any] = Field(default_factory=dict)
     risk_summary: Dict[str, Any] = Field(default_factory=dict)

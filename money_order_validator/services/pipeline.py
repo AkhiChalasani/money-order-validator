@@ -203,6 +203,61 @@ def _same_deposit_slip(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
     return bool((acct_a and acct_b) or (date_a and date_b) or (count_a is not None and count_b is not None))
 
 
+def _deposit_exact_duplicate_key(row: Dict[str, Any]) -> Optional[Tuple[Any, ...]]:
+    """Stable identity for duplicate physical copies of the same deposit slip/receipt.
+
+    The public batch total must not be doubled when the same Chase ticket or receipt is
+    OCR'd more than once. Exact same transaction + exact cents amount is a duplicate.
+    """
+    amount = _deposit_amount_value(row)
+    if amount is None:
+        return None
+    amount_key = f"{round(float(amount) + 1e-9, 2):.2f}"
+    tx = re.sub(r"\s+", "", str(row.get("deposit_transaction") or "")).upper()
+    acct = _clean_account(row.get("deposit_account") or row.get("account_last4"))
+    date_value = str(row.get("deposit_date") or "")
+    source = re.sub(r"[^A-Z0-9]", "", str(row.get("source_system") or row.get("bank_name") or "").upper())
+    try:
+        count = int(row.get("item_count")) if row.get("item_count") is not None else None
+    except (TypeError, ValueError):
+        count = None
+
+    if tx:
+        return ("tx_amount", source, tx, amount_key, count if count is not None else "")
+    if acct and date_value:
+        return ("acct_date_amount", source, acct, date_value, amount_key, count if count is not None else "")
+    if source and count is not None:
+        return ("source_count_amount", source, amount_key, count)
+    return None
+
+
+def _dedupe_deposit_slips_exact(slips: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Collapse exact duplicate deposit slips before aggregate totals are calculated."""
+    out: List[Dict[str, Any]] = []
+    seen: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+    for row in slips:
+        key = _deposit_exact_duplicate_key(row)
+        if key is None:
+            out.append(row)
+            continue
+        existing = seen.get(key)
+        if existing is None:
+            seen[key] = row
+            out.append(row)
+            continue
+        # Merge metadata only; never add amounts/item counts for duplicates.
+        prior_page = existing.get("page_number")
+        row_page = row.get("page_number")
+        _merge_non_empty(existing, row)
+        pages = existing.setdefault("source_pages", [])
+        for pg in (prior_page, row_page):
+            if pg and pg not in pages:
+                pages.append(pg)
+        if pages:
+            existing["page_number"] = min(pages)
+    return out
+
+
 def _is_meaningful_deposit(row: Dict[str, Any]) -> bool:
     if not row:
         return False
@@ -215,8 +270,10 @@ def _add_deposit_slip(slips: List[Dict[str, Any]], patch: Dict[str, Any], page_n
     row = dict(patch)
     row.setdefault("page_number", page_number)
     key = _deposit_key(row)
+    exact_key = _deposit_exact_duplicate_key(row)
     for existing in slips:
-        if _deposit_key(existing) == key or _same_deposit_slip(existing, row):
+        existing_exact_key = _deposit_exact_duplicate_key(existing)
+        if (exact_key is not None and existing_exact_key == exact_key) or _deposit_key(existing) == key or _same_deposit_slip(existing, row):
             prior_page = existing.get("page_number")
             _merge_non_empty(existing, row)
             pages = existing.setdefault("source_pages", [])
@@ -234,6 +291,7 @@ def _aggregate_deposit_slips(slips: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Create a single legacy deposit_slip object from one or more physical slips/receipts."""
     if not slips:
         return {}
+    slips = _dedupe_deposit_slips_exact(slips)
     out: Dict[str, Any] = {}
     for row in slips:
         # Non-total metadata: keep the first useful value. deposit_date handled separately
@@ -794,13 +852,15 @@ class DocumentProcessor:
         non_sequence_register_items = [i for i in register_items if i.get("source") != "deposit_ticket_sequence"]
         raw_instruments = self._reconcile_register_items(raw_instruments, non_sequence_register_items)
         raw_instruments = _mark_unclear_instruments(raw_instruments, batch_data, deposit_data)
+        deposit_slips = _dedupe_deposit_slips_exact(deposit_slips)
         aggregate_deposit = _aggregate_deposit_slips(deposit_slips)
         if aggregate_deposit:
             deposit_data = {**deposit_data, **aggregate_deposit}
         batch = self._build_batch(batch_data, deposit_data, register_items, raw_instruments)
         instruments = self._build_instruments(batch, raw_instruments, file_name)
         validate_instruments(batch, instruments)
-        batch.gl_summary = self._build_gl_summary(batch, instruments)
+        # gl_summary is internal-only and excluded from the public API output.
+        batch.gl_summary = []
         batch.processing_stats = self._build_stats(
             total_pages=len(images),
             ocr_pages=sum(1 for t in ocr_texts if t.strip()),
@@ -1095,7 +1155,11 @@ class DocumentProcessor:
         instrument_sum = round(sum(_as_float(i.get("amount_numeric")) or 0.0 for i in instruments), 2) if instruments else None
         register_sum = round(sum(_as_float(i.get("amount_numeric")) or 0.0 for i in register_items), 2) if register_items else None
         deposit_count = int(deposit_data.get("deposit_slip_count") or 0)
-        if amount is None:
+
+        # A parsed Chase/bank deposit amount is authoritative for the batch. This also fixes
+        # duplicate-scan cases where the same exact slip is parsed twice and batch_data carries
+        # a doubled total.
+        if deposit_amount is not None:
             amount = deposit_amount
         if amount is None and register_sum is not None:
             amount = register_sum
@@ -1121,7 +1185,8 @@ class DocumentProcessor:
         ):
             amount = register_sum
 
-        total_items = batch_data.get("total_items") or deposit_data.get("item_count")
+        deposit_item_count = deposit_data.get("item_count")
+        total_items = deposit_item_count if deposit_item_count is not None else batch_data.get("total_items")
         try:
             total_items = int(total_items) if total_items is not None else None
         except (TypeError, ValueError):
