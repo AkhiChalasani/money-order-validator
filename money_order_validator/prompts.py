@@ -168,6 +168,36 @@ OCR context:
 """.strip()
 
 
+DEPOSIT_DETAIL_REPORT_ROW_CROP_PROMPT = """
+Extract the single authoritative printed transaction row from this Deposit Detail Report row crop.
+
+Return JSON only:
+{
+  "item": {
+    "aux_serial": string|null,
+    "routing_number": string|null,
+    "account_number": string|null,
+    "check_number": string|null,
+    "amount_numeric": number|null,
+    "item_type": string|null,
+    "is_deposit_total": boolean
+  }
+}
+
+Rules:
+- Read only the printed row immediately under the black table header.
+- Do not read handwritten text inside the thumbnail image.
+- The row columns are usually AUX/Serial, RIC, RT, WAUX/FLD4, Account, Check, Amount, Item Type, Item Status.
+- If the row is the aggregate ELECTRONIC/Credit deposit row, set is_deposit_total=true.
+- If the row is a physical payment item, set is_deposit_total=false.
+- Preserve cents exactly. For example 294.36 is 294.36, not 294.56.
+- If AUX/Serial is blank, leave aux_serial null and keep routing_number/account_number/amount_numeric.
+
+OCR context:
+{ocr_context}
+""".strip()
+
+
 REGISTER_ITEMS_PROMPT = """
 Extract the item/register rows from this bank deposit report or property-management batch table.
 Return JSON only:

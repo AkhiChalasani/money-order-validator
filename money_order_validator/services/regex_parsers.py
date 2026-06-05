@@ -609,11 +609,16 @@ def parse_deposit_detail_report_header(text: str) -> Dict[str, Any]:
     if out.get("deposit_total") is not None:
         out.setdefault("deposit_amount", out["deposit_total"])
         out.setdefault("check_total", out["deposit_total"])
-    if m := re.search(r"Item\s+Count\s*:?\s*(\d{1,4})", t, flags=re.IGNORECASE):
-        try:
-            out["report_item_count"] = int(m.group(1))
-        except ValueError:
-            pass
+    for key, pat in (
+        ("credit_items", r"Credit\s+Items\s*:?\s*(\d{1,4})"),
+        ("debit_items", r"Debit\s+Items\s*:?\s*(\d{1,4})"),
+        ("report_item_count", r"Item\s+Count\s*:?\s*(\d{1,4})"),
+    ):
+        if m := re.search(pat, t, flags=re.IGNORECASE):
+            try:
+                out[key] = int(m.group(1))
+            except ValueError:
+                pass
     return {k: v for k, v in out.items() if v not in (None, "", [])}
 
 

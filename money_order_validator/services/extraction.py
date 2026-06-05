@@ -9,6 +9,7 @@ from money_order_validator.clients.azure_openai import llm_client
 from money_order_validator.prompts import (
     BATCH_HEADER_PROMPT,
     DEPOSIT_DETAIL_REPORT_ITEMS_PROMPT,
+    DEPOSIT_DETAIL_REPORT_ROW_CROP_PROMPT,
     DEPOSIT_SLIP_PROMPT,
     DEPOSIT_TICKET_ITEMS_PROMPT,
     INSTRUMENT_EXTRACTION_PROMPT,
@@ -30,6 +31,98 @@ from money_order_validator.services.regex_parsers import (
 from money_order_validator.settings import settings
 
 logger = logging.getLogger(__name__)
+
+
+def _deposit_detail_row_crops(image: Image.Image) -> List[Image.Image]:
+    """Find row-level crops on Deposit Detail Report pages.
+
+    The report uses thick black header bars above each transaction row. A full-page
+    LLM call often misses one row because the table text is small. Cropping from
+    one black header bar to the next gives the model a single row plus its
+    thumbnail, which is much more reliable.
+    """
+    gray = image.convert("L")
+    width, height = gray.size
+    pix = gray.load()
+    dark_rows: List[int] = []
+    threshold = max(int(width * 0.42), 180)
+    for y in range(height):
+        dark = 0
+        for x in range(0, width, 3):
+            if pix[x, y] < 55:
+                dark += 3
+        if dark >= threshold:
+            dark_rows.append(y)
+
+    groups: List[tuple] = []
+    if not dark_rows:
+        return []
+    start = prev = dark_rows[0]
+    for y in dark_rows[1:]:
+        if y - prev <= 4:
+            prev = y
+            continue
+        if prev - start >= 4:
+            groups.append((start, prev))
+        start = prev = y
+    if prev - start >= 4:
+        groups.append((start, prev))
+
+    bars = [(a, b) for a, b in groups if 0.10 * height <= a <= 0.92 * height and (b - a) >= 6]
+    if not bars:
+        return []
+
+    crops: List[Image.Image] = []
+    for i, (top, bottom) in enumerate(bars):
+        next_top = bars[i + 1][0] if i + 1 < len(bars) else min(height, bottom + int(height * 0.26))
+        y0 = max(0, top - 18)
+        y1 = min(height, max(bottom + 90, next_top - 8))
+        if y1 - y0 < 90:
+            continue
+        crop = image.crop((0, y0, width, y1))
+        crops.append(crop)
+    return crops[:6]
+
+
+def _normalize_deposit_detail_row(row: Dict[str, Any], idx: int) -> Optional[Dict[str, Any]]:
+    import re as _re
+    item_type = str(row.get("item_type") or "")
+    if bool(row.get("is_deposit_total")) or item_type.lower() == "credit":
+        return None
+    amount = row.get("amount_numeric")
+    try:
+        amount_f = round(float(str(amount).replace("$", "").replace(",", "")), 2)
+    except (TypeError, ValueError):
+        return None
+    if amount_f <= 0 or amount_f > 5000:
+        return None
+    account = "".join(ch for ch in str(row.get("account_number") or "") if ch.isdigit()) or None
+    check = "".join(ch for ch in str(row.get("check_number") or "") if ch.isdigit()) or None
+    aux_raw = row.get("aux_serial") or row.get("serial_number") or check
+    serial = str(aux_raw).strip() if aux_raw not in (None, "") else None
+    if serial:
+        serial = "".join(ch for ch in serial if ch.isalnum()) or None
+    if not serial and account:
+        m = _re.search(r"(?:40)?((?:19|22)\d{7,10})\d?$", account)
+        if m:
+            serial = m.group(1)
+        elif len(account) >= 9:
+            serial = account[-10:]
+    routing = "".join(ch for ch in str(row.get("routing_number") or "") if ch.isdigit()) or None
+    return {
+        "item_no": row.get("item_no") or idx,
+        "routing_number": routing,
+        "account_number": account,
+        "check_number": check,
+        "serial_number": serial,
+        "amount_numeric": amount_f,
+        "instrument_type": "MoneyOrder",
+        "payment_description": "Payment-MoneyOrder",
+        "source": "transaction_detail_report",
+        "source_system": "Deposit Detail Report",
+        "image_quality": "thumbnail_report_image",
+        "review_flags": ["report_thumbnail_item", "manual_review_required"],
+    }
 
 
 class VisionExtractor:
@@ -255,13 +348,14 @@ class VisionExtractor:
         """Extract authoritative rows from Deposit Detail Report pages.
 
         Reads the printed report row table and ignores embedded thumbnail instrument
-        images, which may be too small or duplicated.
+        images, which may be too small or duplicated. Also tries per-row crops for
+        higher accuracy on pages with small or blurred table text.
         """
-        import re as _re
         parsed = parse_transaction_detail_items(ocr_text)
         if not llm_client.available:
             return parsed, TokenUsage(), False
 
+        total_usage = TokenUsage()
         prompt = DEPOSIT_DETAIL_REPORT_ITEMS_PROMPT.replace(
             "{ocr_context}", compact_ocr_context(ocr_text, max_chars=4000) or "(no OCR text available)"
         )
@@ -273,56 +367,47 @@ class VisionExtractor:
             detail="high",
             max_completion_tokens=3000,
         )
+        total_usage.prompt_tokens += usage.prompt_tokens
+        total_usage.completion_tokens += usage.completion_tokens
+        total_usage.total_tokens += usage.total_tokens
+
         rows = raw.get("items") if isinstance(raw, dict) else None
-        if not isinstance(rows, list):
-            return parsed, usage, True
-
         items: List[Dict[str, Any]] = []
-        for idx, row in enumerate(rows, start=1):
-            if not isinstance(row, dict):
-                continue
-            item_type = str(row.get("item_type") or "")
-            if bool(row.get("is_deposit_total")) or item_type.lower() == "credit":
-                continue
-            amount = row.get("amount_numeric")
-            try:
-                amount_f = round(float(str(amount).replace("$", "").replace(",", "")), 2)
-            except (TypeError, ValueError):
-                continue
-            if amount_f <= 0 or amount_f > 5000:
-                continue
-            account = "".join(ch for ch in str(row.get("account_number") or "") if ch.isdigit()) or None
-            check = "".join(ch for ch in str(row.get("check_number") or "") if ch.isdigit()) or None
-            aux_raw = row.get("aux_serial") or row.get("serial_number") or check
-            serial = str(aux_raw).strip() if aux_raw not in (None, "") else None
-            if serial:
-                serial = "".join(ch for ch in serial if ch.isalnum()) or None
-            if not serial and account:
-                m = _re.search(r"(?:40)?((?:19|22)\d{7,10})\d?$", account)
-                if m:
-                    serial = m.group(1)
-                elif len(account) >= 9:
-                    serial = account[-10:]
-            routing = "".join(ch for ch in str(row.get("routing_number") or "") if ch.isdigit()) or None
-            items.append(
-                {
-                    "item_no": row.get("item_no") or idx,
-                    "routing_number": routing,
-                    "account_number": account,
-                    "check_number": check,
-                    "serial_number": serial,
-                    "amount_numeric": amount_f,
-                    "instrument_type": "MoneyOrder",
-                    "payment_description": "Payment-MoneyOrder",
-                    "source": "transaction_detail_report",
-                    "source_system": "Deposit Detail Report",
-                    "image_quality": "thumbnail_report_image",
-                    "review_flags": ["report_thumbnail_item", "manual_review_required"],
-                }
-            )
+        if isinstance(rows, list):
+            for idx, row in enumerate(rows, start=1):
+                if not isinstance(row, dict):
+                    continue
+                normalized = _normalize_deposit_detail_row(row, idx)
+                if normalized:
+                    items.append(normalized)
 
-        # Merge OCR regex rows with vision rows, preferring the larger unique set.
-        combined = parsed + items
+        # Row-crop fallback: read each black-header-delimited row crop separately.
+        # More reliable than a single full-page call for small/blurred table text.
+        crop_rows: List[Dict[str, Any]] = []
+        for crop_idx, crop in enumerate(_deposit_detail_row_crops(image), start=1):
+            crop_prompt = DEPOSIT_DETAIL_REPORT_ROW_CROP_PROMPT.replace(
+                "{ocr_context}", compact_ocr_context(ocr_text, max_chars=1200) or "(no OCR text available)"
+            )
+            crop_raw, crop_usage = await llm_client.json_vision(
+                system_prompt=LLM_SYSTEM_MSG,
+                user_prompt=crop_prompt,
+                image=crop_to_content(crop),
+                max_width=settings.report_image_width,
+                detail="high",
+                max_completion_tokens=900,
+            )
+            total_usage.prompt_tokens += crop_usage.prompt_tokens
+            total_usage.completion_tokens += crop_usage.completion_tokens
+            total_usage.total_tokens += crop_usage.total_tokens
+            row_obj = crop_raw.get("item") if isinstance(crop_raw, dict) else None
+            if isinstance(row_obj, dict):
+                normalized = _normalize_deposit_detail_row(row_obj, crop_idx)
+                if normalized:
+                    crop_rows.append(normalized)
+
+        # Merge OCR regex rows with full-page and row-crop vision rows. Prefer the
+        # largest unique set; downstream reconciliation will use the control total.
+        combined = parsed + items + crop_rows
         seen: set = set()
         unique: List[Dict[str, Any]] = []
         for item in combined:
@@ -334,7 +419,7 @@ class VisionExtractor:
                 continue
             seen.add(key)
             unique.append(item)
-        return unique, usage, True
+        return unique, total_usage, True
 
     async def extract_register_items(self, image: Image.Image, ocr_text: str) -> Tuple[List[Dict[str, Any]], TokenUsage, bool]:
         """Extract bank/property register rows from a deposit report page.

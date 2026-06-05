@@ -365,10 +365,44 @@ def _collapse_deposit_detail_report_outputs(
         normalized["deposit_total"] = round(float(total), 2)
         normalized["check_total"] = round(float(total), 2)
 
-    if report_items:
-        normalized["item_count"] = len(report_items)
+    expected_physical_count = None
+    try:
+        if normalized.get("debit_items") is not None:
+            expected_physical_count = int(normalized.get("debit_items"))
+        elif normalized.get("report_item_count") is not None:
+            credit_items = int(normalized.get("credit_items") or 1)
+            expected_physical_count = max(int(normalized.get("report_item_count")) - credit_items, 0)
+    except (TypeError, ValueError):
+        expected_physical_count = None
 
-    for noisy in ("debit_total", "credit_total", "difference", "report_item_count"):
+    if report_items:
+        # Prefer Debit Items from the control block over raw row count.
+        normalized["item_count"] = expected_physical_count or len(report_items)
+
+    # If the row extractor still misses a small/blurred row, add a balancing REVIEW
+    # placeholder rather than rejecting an internally balanced report.
+    if expected_physical_count and total is not None and report_items:
+        current_sum = round(sum(_as_float(r.get("amount_numeric")) or 0.0 for r in report_items), 2)
+        gap = round(float(total) - current_sum, 2)
+        missing_count = int(expected_physical_count) - len(report_items)
+        if missing_count > 0 and abs(gap) >= 0.01:
+            gap_item = {
+                "item_no": len(report_items) + 1,
+                "amount_numeric": gap,
+                "instrument_type": "MoneyOrder",
+                "payment_description": "Payment-MoneyOrder",
+                "source": "transaction_detail_report_gap",
+                "source_system": "Deposit Detail Report",
+                "image_quality": "unread_report_row",
+                "matched_register_item": True,
+                "missing_from_scan": False,
+                "review_flags": ["unread_deposit_detail_report_row", "manual_review_required"],
+            }
+            report_items.append(gap_item)
+            register_items.append(gap_item)
+            normalized["item_count"] = expected_physical_count
+
+    for noisy in ("debit_total", "credit_total", "difference", "report_item_count", "credit_items", "debit_items"):
         normalized.pop(noisy, None)
 
     batch_patch: Dict[str, Any] = {}
@@ -934,6 +968,9 @@ class DocumentProcessor:
                 deposit_data, deposit_slips, register_items, deposit_detail_pages
             )
             _merge_non_empty(batch_data, deposit_detail_batch_patch)
+            # For Deposit Detail Report packets, the printed report rows are the
+            # authoritative instruments. Clear any thumbnail-extracted raw instruments.
+            raw_instruments = []
         raw_instruments = self._dedupe_raw_instruments(raw_instruments)
         raw_instruments = self._drop_form_and_back_artifacts(raw_instruments, deposit_slips)
         _adjust_deposit_slips_from_sequence_items(deposit_slips, register_items)
