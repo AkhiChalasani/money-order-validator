@@ -261,7 +261,7 @@ def _dedupe_logical_deposits(slips: List[Dict[str, Any]]) -> List[Dict[str, Any]
                 break
         if not merged:
             kept.append(row)
-    return kept
+    return _merge_metadata_only_deposit_rows(kept)
 
 
 def _same_deposit_slip(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
@@ -360,77 +360,71 @@ def _dedupe_deposit_slips_exact(slips: List[Dict[str, Any]]) -> List[Dict[str, A
     return out
 
 
-def _logical_deposit_key(row: Dict[str, Any]) -> Optional[Tuple[Any, ...]]:
-    """Key for public deposit aggregation.
 
-    Chase teller receipts and physical deposit tickets describe the same deposit
-    with different account OCR or missing transaction fields. Exact same
-    source/date/amount in cents is one logical deposit.
+
+def _same_deposit_metadata_group(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    """True when a receipt-only row describes the same logical Chase deposit.
+
+    Receipt/summary pages can contain only transaction/date, while the matching
+    physical deposit-ticket page contains amount and item_count. Metadata-only rows
+    must be merged into the matching amount row and never counted as separate slips.
     """
-    amount = _deposit_amount_value(row)
-    if amount is None:
-        return None
-    amount_key = f"{round(float(amount) + 1e-9, 2):.2f}"
-    date_value = str(row.get("deposit_date") or row.get("deposited_date") or "")
-    source = _deposit_source_family(row)
-    if date_value:
-        return ("date_amount", source, date_value, amount_key)
-    return ("source_amount", source, amount_key)
+    source_a = re.sub(r"[^A-Z0-9]", "", str(a.get("source_system") or a.get("bank_name") or "").upper())
+    source_b = re.sub(r"[^A-Z0-9]", "", str(b.get("source_system") or b.get("bank_name") or "").upper())
+    chase_sources = {"CHASE", "JPMORGANCHASEBANK", "JPMORGANCHASEBANKNA"}
+    if source_a and source_b and source_a != source_b and not ({source_a, source_b} <= chase_sources):
+        return False
+
+    date_a = str(a.get("deposit_date") or "")
+    date_b = str(b.get("deposit_date") or "")
+    if date_a and date_b and date_a != date_b:
+        return False
+
+    tx_a = re.sub(r"\s+", "", str(a.get("deposit_transaction") or "").upper())
+    tx_b = re.sub(r"\s+", "", str(b.get("deposit_transaction") or "").upper())
+    if tx_a and tx_b and tx_a == tx_b:
+        return True
+
+    try:
+        page_a = int(a.get("page_number") or -1)
+        page_b = int(b.get("page_number") or -2)
+    except (TypeError, ValueError):
+        page_a, page_b = -1, -2
+    return page_a > 0 and page_a == page_b
 
 
-def _deposit_row_score(row: Dict[str, Any]) -> int:
-    """Prefer physical tickets with counts over receipt/metadata rows when merging."""
-    score = 0
-    if _deposit_amount_value(row) is not None:
-        score += 10
-    if row.get("item_count") is not None:
-        score += 8
-    if row.get("check_total") is not None or row.get("deposit_total") is not None:
-        score += 4
-    if row.get("deposit_account") not in (None, "", [], {}):
-        score += 2
-    return score
+def _merge_metadata_only_deposit_rows(slips: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Remove phantom receipt rows from public deposit_slips.
 
-
-def _dedupe_logical_deposit_slips(slips: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Collapse receipt + ticket duplicates before public totals are calculated.
-
-    Rows without an amount are metadata-only and must not become separate deposit slips.
-    Same amount/date/source in cents is treated as the same deposit.
+    Rows that have transaction/date metadata but no amount and no item_count are
+    not physical deposits. Merge their useful fields into the corresponding
+    amount-bearing row. If they cannot be matched, suppress them so
+    deposit_slip_count and batch totals are not inflated.
     """
-    out: List[Dict[str, Any]] = []
-    seen: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+    amount_rows: List[Dict[str, Any]] = []
+    metadata_rows: List[Dict[str, Any]] = []
     for row in slips:
-        if _deposit_amount_value(row) is None:
+        if _deposit_amount_value(row) is None and row.get("item_count") in (None, "", [], {}):
+            metadata_rows.append(row)
+        else:
+            amount_rows.append(row)
+    if not amount_rows:
+        return slips
+
+    for meta in metadata_rows:
+        target = next((r for r in amount_rows if _same_deposit_metadata_group(meta, r)), None)
+        if target is None:
             continue
-        key = _logical_deposit_key(row) or _deposit_exact_duplicate_key(row)
-        if key is None:
-            out.append(row)
-            continue
-        existing = seen.get(key)
-        if existing is None:
-            seen[key] = row
-            out.append(row)
-            continue
-        keep, merge = (existing, row)
-        if _deposit_row_score(row) > _deposit_row_score(existing):
-            idx = out.index(existing)
-            out[idx] = row
-            seen[key] = row
-            keep, merge = row, existing
-        prior_page = keep.get("page_number")
-        merge_page = merge.get("page_number")
-        _merge_non_empty(keep, merge)
-        for field in ("deposit_amount", "deposit_total", "check_total", "item_count"):
-            if row.get(field) not in (None, "", [], {}) and _deposit_row_score(row) >= _deposit_row_score(existing):
-                keep[field] = row[field]
-        pages = keep.setdefault("source_pages", [])
-        for pg in (prior_page, merge_page):
+        prior_page = target.get("page_number")
+        meta_page = meta.get("page_number")
+        _merge_non_empty(target, meta)
+        pages = target.setdefault("source_pages", [])
+        for pg in (prior_page, meta_page):
             if pg and pg not in pages:
                 pages.append(pg)
         if pages:
-            keep["page_number"] = min(pages)
-    return out
+            target["page_number"] = min(pages)
+    return amount_rows
 
 
 def _is_meaningful_deposit(row: Dict[str, Any]) -> bool:
