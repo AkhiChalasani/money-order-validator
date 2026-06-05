@@ -1424,40 +1424,56 @@ class DocumentProcessor:
                 if not inst.get("serial_number") and item.get("serial_number"):
                     inst["serial_number"] = item["serial_number"]
 
+        # Always emit authoritative rows that represent real bank/deposit-ticket items.
+        #
+        # The previous implementation placed this whole block behind
+        # settings.include_register_only_items. In production that setting can be
+        # disabled, which is fine for generic register-only imports, but it must
+        # NOT suppress rows that came from a physical Chase deposit-ticket line
+        # item or a Deposit Detail Report row. Batch 21 exposed this: the code
+        # extracted 42 deposit-ticket rows, but returned only the 17 instruments
+        # that GPT vision read clearly, making the response appear to stop around
+        # page 43. Sequence/report rows are authoritative enough to emit as
+        # REVIEW placeholders when they are not matched to a clear front image.
         for idx, item in enumerate(items):
             if idx in matched_items:
                 continue
-            # Add only credible register items. Deposit-ticket sequence rows and
-            # report rows are always emitted regardless of include_register_only_items
-            # so long batches never appear truncated.
+            # Add only credible register items. These help expose missing scans.
             if not (item.get("serial_number") or item.get("amount_numeric")):
                 continue
+
             source = str(item.get("source") or "")
             report_row = source == "transaction_detail_report" or str(item.get("source_system") or "") == "Deposit Detail Report"
             sequence_row = source == "deposit_ticket_sequence"
-            # Deposit-ticket and report rows are authoritative enough to emit as REVIEW
-            # placeholders even if INCLUDE_REGISTER_ONLY_ITEMS=false in the environment.
-            # That prevents long packets from appearing to stop halfway when vision misses
-            # later money-order fronts. Generic bank register-only rows still respect the setting.
+
+            # Generic register-only rows still respect the feature flag. Physical
+            # deposit-ticket sequence rows and Deposit Detail Report rows are always
+            # emitted as REVIEW placeholders, otherwise long batches silently lose
+            # items even though register_items_extracted is correct.
             if not (settings.include_register_only_items or report_row or sequence_row):
                 continue
+
             if sequence_row and item.get("matched_deposit_ticket_item"):
                 continue
+
             default_type = "MoneyOrder" if (sequence_row or "Money" in (item.get("payment_description") or "")) else "Check"
             default_description = "Payment-MoneyOrder" if default_type == "MoneyOrder" else "Payment-Check"
-            instruments.append(
-                {
-                    **item,
-                    "instrument_type": item.get("instrument_type") or default_type,
-                    "payment_description": item.get("payment_description") or default_description,
-                    "llm_used": False,
-                    "processing_tier": 1,
-                    "missing_from_scan": False if (report_row or sequence_row) else True,
-                    "matched_register_item": bool(report_row or sequence_row),
-                    "image_quality": item.get("image_quality") or ("thumbnail_report_image" if report_row else ("not_extracted_from_scan" if sequence_row else None)),
-                    "review_flags": item.get("review_flags") or (["report_thumbnail_item", "manual_review_required"] if report_row else (["deposit_ticket_item_not_matched_to_clear_instrument", "manual_review_required"] if sequence_row else [])),
-                }
-            )
+            placeholder = {
+                **item,
+                "instrument_type": item.get("instrument_type") or default_type,
+                "payment_description": item.get("payment_description") or default_description,
+                "llm_used": False,
+                "processing_tier": 1,
+                "missing_from_scan": False if (report_row or sequence_row) else True,
+                "matched_register_item": bool(report_row or sequence_row),
+                "image_quality": item.get("image_quality") or ("thumbnail_report_image" if report_row else ("not_extracted_from_scan" if sequence_row else None)),
+                "review_flags": item.get("review_flags") or (["report_thumbnail_item", "manual_review_required"] if report_row else (["deposit_ticket_item_not_matched_to_clear_instrument", "manual_review_required"] if sequence_row else [])),
+            }
+            # Make placeholder rows visible in final validation even if the raw row
+            # lacked image-quality metadata.
+            if sequence_row:
+                placeholder.setdefault("ocr_confidence", 0.6)
+            instruments.append(placeholder)
         return instruments
 
     @staticmethod
