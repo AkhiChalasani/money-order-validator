@@ -31,14 +31,28 @@ def crop_to_content(image: Image.Image, margin: int = 30) -> Image.Image:
 
 
 def maybe_rotate_for_reading(image: Image.Image, angle: float | None) -> Image.Image:
-    """DI angle is informational; GPT vision handles rotation well.
+    """Return a page image normalized for reading, using Azure DI page angle.
 
-    Only rotate for obvious 90-degree page angle values. Keeping this conservative prevents
-    damaging already-readable scans.
+    Azure Document Intelligence exposes a page-level ``angle`` when the scanned
+    text is rotated. In these money-order batches, several real *front* pages are
+    scanned upside down. GPT vision can often read them, but it regularly drops
+    amount words/cents on inverted money orders, e.g. 442.00 -> 400.00 or
+    525.50 -> 525.00. Normalize only when Azure reports a clear right-angle
+    rotation so already-upright pages are not damaged.
     """
     if angle is None:
         return image
-    rounded = int(round(angle)) % 360
-    if rounded in (90, 270):
-        return image.rotate(-rounded, expand=True)
+    try:
+        rounded = int(round(float(angle))) % 360
+    except (TypeError, ValueError):
+        return image
+
+    # DI angles are the observed page orientation. Rotate in the opposite direction
+    # for 90/270, and 180 for upside-down pages.
+    if rounded in range(80, 101):
+        return image.rotate(-90, expand=True)
+    if rounded in range(170, 191):
+        return image.rotate(180, expand=True)
+    if rounded in range(260, 281):
+        return image.rotate(90, expand=True)
     return image

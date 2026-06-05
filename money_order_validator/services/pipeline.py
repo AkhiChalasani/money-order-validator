@@ -532,6 +532,7 @@ class DocumentProcessor:
             raise ValueError(f"PDF rendered zero pages: {file_name}")
 
         ocr_texts = self._ocr_texts_by_page(ocr_pages, len(images))
+        ocr_angles = self._ocr_angles_by_page(ocr_pages, len(images))
         raw_instruments: List[Dict[str, Any]] = []
         batch_data: Dict[str, Any] = {}
         deposit_data: Dict[str, Any] = {}
@@ -545,6 +546,7 @@ class DocumentProcessor:
         for page_idx, image in enumerate(images):
             page_number = page_idx + 1
             ocr_text = ocr_texts[page_idx]
+            page_angle = ocr_angles[page_idx] if page_idx < len(ocr_angles) else None
             kind, scores = classify_page(ocr_text)
             # If Azure DI is unavailable or returned no text for an image-only page,
             # do not treat it as blank when an LLM vision client is configured.
@@ -554,6 +556,7 @@ class DocumentProcessor:
             log_row: Dict[str, Any] = {
                 "page_number": page_number,
                 "kind": kind.value,
+                "ocr_angle": page_angle,
                 "scores": scores,
                 "ocr_chars": len(ocr_text),
                 "llm_used": False,
@@ -652,7 +655,7 @@ class DocumentProcessor:
             if kind == PageKind.UNKNOWN:
                 should_extract = _should_try_unknown_vision(ocr_text)
             if should_extract:
-                instruments, usage, used = await vision_extractor.extract_instruments(image, ocr_text, kind)
+                instruments, usage, used = await vision_extractor.extract_instruments(image, ocr_text, kind, page_angle=page_angle)
                 if used:
                     llm_calls += 1
                     self._accumulate_usage(usage_total, usage)
@@ -729,6 +732,15 @@ class DocumentProcessor:
             idx = p.page_number - 1
             if 0 <= idx < expected_pages:
                 out[idx] = p.text or ""
+        return out
+
+    @staticmethod
+    def _ocr_angles_by_page(pages: List[OcrPage], expected_pages: int) -> List[Optional[float]]:
+        out: List[Optional[float]] = [None] * expected_pages
+        for p in pages:
+            idx = p.page_number - 1
+            if 0 <= idx < expected_pages:
+                out[idx] = p.angle
         return out
 
     @staticmethod
@@ -837,16 +849,43 @@ class DocumentProcessor:
                 if seq_amount is None:
                     continue
                 old_amount = _as_float(inst.get("amount_numeric"))
-                if old_amount != seq_amount:
+
+                # Deposit-ticket row OCR is weaker than the instrument itself. It is useful
+                # for filling blanks and restoring missing cents, but it must not overwrite
+                # a real instrument amount/amount_words with a lower-confidence handwritten
+                # row read. The repeated failure was inverted MOs like 442.00 -> 400.00 or
+                # 525.50 -> 525.00 being made worse by ticket-row extraction.
+                has_words = bool(str(inst.get("amount_words") or "").strip())
+                should_apply_amount = False
+                if old_amount is None:
+                    should_apply_amount = True
+                elif not has_words:
+                    same_dollars = int(float(old_amount)) == int(float(seq_amount))
+                    old_has_no_cents = abs(float(old_amount) - int(float(old_amount))) < 0.005
+                    seq_has_cents = abs(float(seq_amount) - int(float(seq_amount))) >= 0.005
+                    # Safe cents-only repair, e.g. 621 -> 621.50.
+                    should_apply_amount = bool(same_dollars and old_has_no_cents and seq_has_cents)
+
+                if should_apply_amount and old_amount != seq_amount:
                     inst.setdefault("corrections", []).append({
                         "field": "amount_numeric",
                         "old": old_amount,
                         "new": seq_amount,
-                        "source": "deposit_ticket_sequence",
+                        "source": "deposit_ticket_sequence_fill_only",
                         "slip_page_number": slip_page,
                         "row_item_no": row.get("item_no"),
                     })
                     inst["amount_numeric"] = seq_amount
+                elif old_amount != seq_amount:
+                    inst.setdefault("corrections", []).append({
+                        "field": "amount_numeric",
+                        "old": old_amount,
+                        "rejected_new": seq_amount,
+                        "source": "deposit_ticket_sequence_rejected_instrument_has_words",
+                        "slip_page_number": slip_page,
+                        "row_item_no": row.get("item_no"),
+                    })
+
                 if row.get("unit") and not inst.get("unit"):
                     inst["unit"] = str(row.get("unit"))
                 inst["matched_deposit_ticket_item"] = True

@@ -15,7 +15,7 @@ from money_order_validator.prompts import (
     REGISTER_ITEMS_PROMPT,
 )
 from money_order_validator.schemas import TokenUsage
-from money_order_validator.services.image_utils import crop_to_content
+from money_order_validator.services.image_utils import crop_to_content, maybe_rotate_for_reading
 from money_order_validator.services.ocr_context import compact_ocr_context
 from money_order_validator.services.page_classifier import PageKind
 from money_order_validator.services.regex_parsers import (
@@ -36,6 +36,7 @@ class VisionExtractor:
         image: Image.Image,
         ocr_text: str,
         page_kind: PageKind,
+        page_angle: Optional[float] = None,
     ) -> Tuple[List[Dict[str, Any]], TokenUsage, bool]:
         """Return instruments, token usage, and whether LLM was used."""
         ocr_context = compact_ocr_context(ocr_text)
@@ -52,7 +53,10 @@ class VisionExtractor:
 
         prompt = INSTRUMENT_EXTRACTION_PROMPT.replace("{ocr_context}", ocr_context or "(no OCR text available)")
         width = settings.report_image_width if page_kind == PageKind.REPORT_WITH_INSTRUMENTS else settings.max_image_width
-        img = crop_to_content(image)
+        # Normalize obvious upside-down/sideways pages before vision extraction. This is
+        # critical for amount fidelity on inverted money orders: the model may otherwise
+        # read a plausible-but-wrong value from the amount box/words.
+        img = crop_to_content(maybe_rotate_for_reading(image, page_angle))
         raw, usage = await llm_client.json_vision(
             system_prompt=LLM_SYSTEM_MSG,
             user_prompt=prompt,
