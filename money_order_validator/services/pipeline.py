@@ -15,6 +15,7 @@ from money_order_validator.services.extraction import vision_extractor
 from money_order_validator.services.page_classifier import PageKind, classify_page
 from money_order_validator.services.regex_parsers import (
     build_property_aliases,
+    is_deposit_detail_report,
     normalize_bank_name,
     normalize_payee,
     normalize_serial,
@@ -329,6 +330,68 @@ def _aggregate_deposit_slips(slips: List[Dict[str, Any]]) -> Dict[str, Any]:
     out["deposit_slip_count"] = len(slips)
     out["deposit_slips"] = slips
     return out
+
+
+def _collapse_deposit_detail_report_outputs(
+    deposit_data: Dict[str, Any],
+    deposit_slips: List[Dict[str, Any]],
+    register_items: List[Dict[str, Any]],
+    report_pages: List[int],
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Dict[str, Any]]:
+    """Normalize Deposit Detail Report PDFs to one logical deposit.
+
+    This document family has one aggregate deposit/credit total and one row per physical
+    payment item. Treating each report page as its own deposit slip creates duplicated
+    totals; this function collapses them to a single authoritative entry.
+    """
+    if not report_pages:
+        return deposit_data, deposit_slips, {}
+
+    report_items = [r for r in register_items if r.get("source") == "transaction_detail_report"]
+    item_sum = round(sum(_as_float(r.get("amount_numeric")) or 0.0 for r in report_items), 2) if report_items else None
+
+    normalized = dict(deposit_data or {})
+    normalized["bank_name"] = normalize_bank_name(normalized.get("bank_name") or "JPMorgan Chase Bank")
+    normalized["source_system"] = normalized.get("source_system") or "Deposit Detail Report"
+    normalized["source_pages"] = sorted(set(report_pages))
+    normalized["page_number"] = min(report_pages)
+
+    parsed_total = _as_float(normalized.get("deposit_total") or normalized.get("check_total") or normalized.get("credit_total") or normalized.get("deposit_amount"))
+    total = parsed_total if parsed_total is not None else item_sum
+    if item_sum is not None and (total is None or abs(float(total) - float(item_sum)) <= 1.00 or float(total) > float(item_sum) * 1.5):
+        total = item_sum
+    if total is not None:
+        normalized["deposit_amount"] = round(float(total), 2)
+        normalized["deposit_total"] = round(float(total), 2)
+        normalized["check_total"] = round(float(total), 2)
+
+    if report_items:
+        normalized["item_count"] = len(report_items)
+
+    for noisy in ("debit_total", "credit_total", "difference", "report_item_count"):
+        normalized.pop(noisy, None)
+
+    batch_patch: Dict[str, Any] = {}
+    if normalized.get("deposit_amount") is not None:
+        batch_patch["batch_amount"] = normalized["deposit_amount"]
+    if normalized.get("item_count") is not None:
+        batch_patch["total_items"] = normalized["item_count"]
+    if normalized.get("deposit_date"):
+        batch_patch["deposited_date"] = normalized.get("deposit_date")
+        batch_patch["printed_on"] = normalized.get("deposit_date")
+    if normalized.get("deposit_account"):
+        batch_patch["account_number"] = normalized.get("deposit_account")
+    if normalized.get("deposit_transaction"):
+        batch_patch["deposit_transaction"] = normalized.get("deposit_transaction")
+    if normalized.get("account_name"):
+        batch_patch["property_name"] = normalized.get("account_name")
+        batch_patch["property_aliases"] = build_property_aliases(normalized.get("account_name"))
+
+    normalized["deposit_slip_count"] = 1
+    public_row = dict(normalized)
+    public_row.pop("deposit_slips", None)
+    normalized["deposit_slips"] = [public_row]
+    return normalized, [public_row], batch_patch
 
 
 def _should_extract_register_with_vision(kind: PageKind, ocr_text: str, page_deposit: Dict[str, Any]) -> bool:
@@ -692,6 +755,7 @@ class DocumentProcessor:
         deposit_data: Dict[str, Any] = {}
         deposit_slips: List[Dict[str, Any]] = []
         register_items: List[Dict[str, Any]] = []
+        deposit_detail_pages: List[int] = []
         page_logs: List[Dict[str, Any]] = []
         usage_total = TokenUsage()
         llm_calls = 0
@@ -721,10 +785,15 @@ class DocumentProcessor:
             # mixed pages above instruments, so parse deposit metadata on every OCR page. Batch
             # header/property parsing is still restricted to report-like pages to avoid treating a
             # check drawer as the property name.
+            page_is_deposit_detail_report = is_deposit_detail_report(ocr_text)
+            if page_is_deposit_detail_report:
+                deposit_detail_pages.append(page_number)
+                log_row["deposit_detail_report"] = True
             page_deposit = parse_deposit_info(ocr_text)
             if page_deposit:
                 _merge_non_empty(deposit_data, page_deposit)
-                _add_deposit_slip(deposit_slips, page_deposit, page_number)
+                if not page_is_deposit_detail_report:
+                    _add_deposit_slip(deposit_slips, page_deposit, page_number)
                 log_row["deposit_detected"] = True
             if kind in {PageKind.BATCH_HEADER, PageKind.DEPOSIT_REPORT, PageKind.REPORT_WITH_INSTRUMENTS, PageKind.DEPOSIT_SLIP, PageKind.UNKNOWN, PageKind.RECEIPT}:
                 _merge_non_empty(batch_data, parse_batch_header(ocr_text))
@@ -744,7 +813,7 @@ class DocumentProcessor:
             # deposit total. This is page-scoped, not global: a single PDF can contain multiple
             # physical deposit slips/receipts and we need each one's total separately.
             needs_deposit_total = not (page_deposit.get("deposit_amount") or page_deposit.get("deposit_total") or page_deposit.get("check_total"))
-            if needs_deposit_total and (
+            if (not page_is_deposit_detail_report) and needs_deposit_total and (
                 kind in {PageKind.RECEIPT, PageKind.DEPOSIT_REPORT, PageKind.DEPOSIT_SLIP, PageKind.REPORT_WITH_INSTRUMENTS}
                 or _page_has_deposit_ticket(ocr_text, page_deposit)
             ):
@@ -759,7 +828,7 @@ class DocumentProcessor:
                     log_row["llm_used"] = True
                     log_row["deposit_vision_used"] = True
 
-            if _page_has_deposit_ticket(ocr_text, page_deposit) and (page_deposit.get("item_count") or kind in {PageKind.DEPOSIT_SLIP, PageKind.DEPOSIT_REPORT, PageKind.REPORT_WITH_INSTRUMENTS, PageKind.UNKNOWN}):
+            if (not page_is_deposit_detail_report) and _page_has_deposit_ticket(ocr_text, page_deposit) and (page_deposit.get("item_count") or kind in {PageKind.DEPOSIT_SLIP, PageKind.DEPOSIT_REPORT, PageKind.REPORT_WITH_INSTRUMENTS, PageKind.UNKNOWN}):
                 seq_items, usage, used = await vision_extractor.extract_deposit_ticket_items(
                     image,
                     ocr_text,
@@ -792,7 +861,7 @@ class DocumentProcessor:
                         self._accumulate_usage(usage_total, usage)
                         phase_tokens["batch_header"] += usage.total_tokens
                         log_row["llm_used"] = True
-                elif kind in {PageKind.DEPOSIT_REPORT, PageKind.DEPOSIT_SLIP} and not (page_deposit.get("deposit_amount") or page_deposit.get("deposit_total") or page_deposit.get("check_total")):
+                elif kind in {PageKind.DEPOSIT_REPORT, PageKind.DEPOSIT_SLIP} and not page_is_deposit_detail_report and not (page_deposit.get("deposit_amount") or page_deposit.get("deposit_total") or page_deposit.get("check_total")):
                     patch, usage, used = await vision_extractor.extract_deposit(image, ocr_text)
                     _merge_non_empty(deposit_data, patch)
                     page_deposit = {**page_deposit, **(patch or {})}
@@ -843,6 +912,11 @@ class DocumentProcessor:
             page_logs.append(log_row)
 
         register_items = self._dedupe_register_items(register_items)
+        if deposit_detail_pages:
+            deposit_data, deposit_slips, deposit_detail_batch_patch = _collapse_deposit_detail_report_outputs(
+                deposit_data, deposit_slips, register_items, deposit_detail_pages
+            )
+            _merge_non_empty(batch_data, deposit_detail_batch_patch)
         raw_instruments = self._dedupe_raw_instruments(raw_instruments)
         raw_instruments = self._drop_form_and_back_artifacts(raw_instruments, deposit_slips)
         _adjust_deposit_slips_from_sequence_items(deposit_slips, register_items)
@@ -947,7 +1021,6 @@ class DocumentProcessor:
             out.append(row)
         return out
 
-    @staticmethod
     @staticmethod
     def _instrument_quality_score(row: Dict[str, Any]) -> int:
         """Integer quality rank used to select the best rows when over-extraction occurs."""

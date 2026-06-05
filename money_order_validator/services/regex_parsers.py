@@ -535,6 +535,88 @@ def _one_line(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip(" :-")
 
 
+def is_deposit_detail_report(text: str) -> bool:
+    """Detect bank Deposit Detail Report pages with transaction item rows.
+
+    These reports already contain authoritative transaction id, account, row amounts,
+    and row serial/account values. Thumbnail images on the report must not be treated
+    as separate physical instruments.
+    """
+    t = norm_text(text).upper()
+    return bool(
+        re.search(r"\bDEPOSIT\s+DETAIL\s+REPORT\b", t)
+        or (
+            re.search(r"\bDEPOSIT\s+DETAIL\s+FOR\s+DEPOSIT\s+ID\b", t)
+            and re.search(r"\bTRANSACTION\s+DETAIL\s+FOR\s+TRANSACTION\s+ID\b", t)
+        )
+        or (
+            re.search(r"\bDEPOSIT\s+CONTROL\s+INFORMATION\b", t)
+            and re.search(r"\bTRANSACTION\s+CONTROL\s+INFORMATION\b", t)
+        )
+    )
+
+
+def parse_deposit_detail_report_header(text: str) -> Dict[str, Any]:
+    """Parse Deposit Detail Report header/summary fields.
+
+    This report type has one logical deposit spread across multiple pages.
+    Per-page item rows must not be aggregated as separate deposit slips.
+    """
+    if not is_deposit_detail_report(text):
+        return {}
+    t = norm_text(text)
+    out: Dict[str, Any] = {
+        "source_system": "Deposit Detail Report",
+        "bank_name": "JPMorgan Chase Bank",
+    }
+
+    if m := re.search(r"Deposit\s+Detail\s+for\s+Deposit\s+ID\s*:?\s*(\d{4,})", t, flags=re.IGNORECASE):
+        out["deposit_id"] = m.group(1)
+    if m := re.search(r"Transaction\s+Detail\s+for\s+Transaction\s+ID\s*:?\s*(\d{4,})", t, flags=re.IGNORECASE):
+        out["deposit_transaction"] = m.group(1)
+    if m := re.search(r"Batch\s+ID\s*:?\s*(\d{4,})", t, flags=re.IGNORECASE):
+        out["batch_number"] = m.group(1)
+    if m := re.search(r"Processing\s+Date\s*:?\s*(20\d{2}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}/\d{1,2}/\d{2,4})", t, flags=re.IGNORECASE):
+        out["deposit_date"] = parse_date(m.group(1))
+        out["deposited_date"] = out["deposit_date"]
+        out["printed_on"] = out["deposit_date"]
+    if m := re.search(r"Account\s+Name\s*:?\s*([^\n]+?)(?=\s+Location\s+ID\b|\s+Transaction\s+Detail\b|$)", t, flags=re.IGNORECASE):
+        name = _clean_property_name(m.group(1))
+        if name:
+            out["account_name"] = name
+            out["property_name"] = name
+            out["property_aliases"] = build_property_aliases(name)
+    if m := re.search(r"Deposit\s+Account\s*:?\s*(\d{4,})(?:\s*-\s*([^\n]+?))?(?=\s+Partnership\b|\s+AUX|$)", t, flags=re.IGNORECASE):
+        out["deposit_account"] = m.group(1)
+        out["account_number"] = m.group(1)
+        if m.group(2):
+            name = _clean_property_name(m.group(2))
+            if name:
+                out.setdefault("account_name", name)
+                out.setdefault("property_name", name)
+    for key, pat in (
+        ("deposit_total", r"Deposit\s+Total\s*:?\s*\$?\s*([\d,]+\.\d{2})"),
+        ("check_total", r"Checks?\s+Total\s*:?\s*\$?\s*([\d,]+\.\d{2})"),
+        ("credit_total", r"Credit\s+Total\s*:?\s*\$?\s*([\d,]+\.\d{2})"),
+        ("debit_total", r"Debit\s+Total\s*:?\s*\$?\s*([\d,]+\.\d{2})"),
+        ("deposit_amount", r"Deposit\s+Amount\s*:?\s*\$?\s*([\d,]+\.\d{2})"),
+    ):
+        m = re.search(pat, t, flags=re.IGNORECASE)
+        if m:
+            val = parse_money(m.group(1))
+            if val is not None:
+                out[key] = val
+    if out.get("deposit_total") is not None:
+        out.setdefault("deposit_amount", out["deposit_total"])
+        out.setdefault("check_total", out["deposit_total"])
+    if m := re.search(r"Item\s+Count\s*:?\s*(\d{1,4})", t, flags=re.IGNORECASE):
+        try:
+            out["report_item_count"] = int(m.group(1))
+        except ValueError:
+            pass
+    return {k: v for k, v in out.items() if v not in (None, "", [])}
+
+
 def _clean_property_name(value: Optional[str]) -> Optional[str]:
     if not value:
         return None
@@ -762,9 +844,16 @@ def parse_transaction_detail_items(text: str) -> List[Dict[str, Any]]:
         if amount is None or amount <= 0 or amount > 5000:
             continue
         serial = normalize_serial(m.group("aux") or m.group("check"))
+        acct = m.group("account")
         if not serial:
-            acct = m.group("account")
-            serial = normalize_serial(acct[-10:]) if len(acct) >= 9 else None
+            # Western Union/Kroger report account values often look like
+            # 40198336200716: 40 + printed 19XXXXXXXXX serial + check digit.
+            # Keep the readable 19/22 serial when present instead of the full MICR tail.
+            serial_match = re.search(r"(?:40)?((?:19|22)\d{7,10})\d?$", acct or "")
+            if serial_match:
+                serial = normalize_serial(serial_match.group(1))
+            else:
+                serial = normalize_serial(acct[-10:]) if len(acct) >= 9 else None
         item_no += 1
         items.append(
             {
@@ -777,6 +866,7 @@ def parse_transaction_detail_items(text: str) -> List[Dict[str, Any]]:
                 "payment_description": "Payment-MoneyOrder",
                 "instrument_type": "MoneyOrder",
                 "source": "transaction_detail_report",
+                "source_system": "Deposit Detail Report",
             }
         )
     return items
@@ -788,6 +878,14 @@ def parse_batch_header(text: str) -> Dict[str, Any]:
     _regions = parse_regions_deposit_header(t)
     if _regions:
         result.update(_regions)
+
+    deposit_detail = parse_deposit_detail_report_header(t)
+    if deposit_detail:
+        # Keep deposit-detail fields but do not let generic header OCR overwrite
+        # key values with labels like Worktype as the property.
+        result.update({k: v for k, v in deposit_detail.items() if k not in {"deposit_amount", "deposit_total", "check_total", "credit_total", "debit_total", "report_item_count"}})
+        if deposit_detail.get("deposit_total") is not None:
+            result["batch_amount"] = deposit_detail["deposit_total"]
 
     def after_label(label_pat: str, stop: str = r"\n|Batch\s+|Bank\s+|Account\s+|Actual\s+|Line\s+|Period\s+|Printed\s+|Deposit\s+") -> Optional[str]:
         m = re.search(r"(?:" + label_pat + r")\s*:?[ \t]*([^\n]+)", t, flags=re.IGNORECASE)
@@ -880,6 +978,10 @@ def parse_batch_header(text: str) -> Dict[str, Any]:
 def parse_deposit_info(text: str) -> Dict[str, Any]:
     t = norm_text(text)
     out: Dict[str, Any] = {}
+
+    deposit_detail = parse_deposit_detail_report_header(t)
+    if deposit_detail:
+        out.update(deposit_detail)
 
     deposit_context = bool(
         re.search(
