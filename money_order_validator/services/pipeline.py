@@ -174,6 +174,96 @@ def _deposit_key(row: Dict[str, Any]) -> Tuple[Any, ...]:
     return ("page", row.get("page_number"), amount, item_count or "")
 
 
+def _deposit_source_family(row: Dict[str, Any]) -> str:
+    raw = str(row.get("source_system") or row.get("bank_name") or "").upper()
+    raw = re.sub(r"[^A-Z0-9]", "", raw)
+    if "CHASE" in raw or "JPMORGAN" in raw or raw in {"JPM", "JPMC"}:
+        return "CHASE"
+    if "REGIONS" in raw:
+        return "REGIONS"
+    return raw
+
+
+def _deposit_has_item_count(row: Dict[str, Any]) -> bool:
+    try:
+        return row.get("item_count") is not None and int(row.get("item_count")) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_chase_receipt_duplicate_of_ticket(receipt: Dict[str, Any], ticket: Dict[str, Any]) -> bool:
+    """True when a teller/QuickDeposit receipt repeats a physical deposit-ticket total.
+
+    The receipt and ticket can have different OCR'd account fragments but the same
+    Chase date + exact amount. Only the physical ticket with item_count should
+    contribute to batch totals.
+    """
+    if _deposit_source_family(receipt) != "CHASE" or _deposit_source_family(ticket) != "CHASE":
+        return False
+    amount_a = _deposit_amount_value(receipt)
+    amount_b = _deposit_amount_value(ticket)
+    if amount_a is None or amount_b is None or abs(float(amount_a) - float(amount_b)) >= 0.005:
+        return False
+    date_a = str(receipt.get("deposit_date") or "")
+    date_b = str(ticket.get("deposit_date") or "")
+    if date_a and date_b and date_a != date_b:
+        return False
+    return _deposit_has_item_count(receipt) != _deposit_has_item_count(ticket)
+
+
+def _dedupe_logical_deposits(slips: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return logical deposits for totals, dropping receipt duplicates.
+
+    More liberal than exact-copy dedupe: Chase receipt pages and Chase deposit-ticket
+    pages for the same amount/date are the same deposit even when OCR extracts different
+    transaction/account text. Prefer the ticket row that has item_count.
+    """
+    slips = _dedupe_deposit_slips_exact(slips)
+    kept: List[Dict[str, Any]] = []
+    for row in slips:
+        merged = False
+        for existing in kept:
+            if _is_chase_receipt_duplicate_of_ticket(row, existing):
+                target, source = (existing, row) if _deposit_has_item_count(existing) else (row, existing)
+                if target is not existing:
+                    kept[kept.index(existing)] = target
+                prior_page = target.get("page_number")
+                row_page = source.get("page_number")
+                _merge_non_empty(target, source)
+                pages = target.setdefault("source_pages", [])
+                for pg in (prior_page, row_page):
+                    if pg and pg not in pages:
+                        pages.append(pg)
+                if pages:
+                    target["page_number"] = min(pages)
+                merged = True
+                break
+            # Exact same Chase amount/date/item_count = duplicate scan of same ticket.
+            if (
+                _deposit_source_family(row) == "CHASE"
+                and _deposit_source_family(existing) == "CHASE"
+                and _deposit_amount_value(row) is not None
+                and _deposit_amount_value(existing) is not None
+                and abs(float(_deposit_amount_value(row)) - float(_deposit_amount_value(existing))) < 0.005
+                and str(row.get("deposit_date") or "") == str(existing.get("deposit_date") or "")
+                and _deposit_has_item_count(row)
+                and _deposit_has_item_count(existing)
+                and int(row.get("item_count") or 0) == int(existing.get("item_count") or 0)
+            ):
+                _merge_non_empty(existing, row)
+                pages = existing.setdefault("source_pages", [])
+                for pg in (existing.get("page_number"), row.get("page_number")):
+                    if pg and pg not in pages:
+                        pages.append(pg)
+                if pages:
+                    existing["page_number"] = min(pages)
+                merged = True
+                break
+        if not merged:
+            kept.append(row)
+    return kept
+
+
 def _same_deposit_slip(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
     """Return True when two parsed rows describe the same physical/logical deposit."""
     amount_a = _deposit_amount_value(a)
@@ -186,8 +276,8 @@ def _same_deposit_slip(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
     date_b = b.get("deposit_date")
     count_a = a.get("item_count")
     count_b = b.get("item_count")
-    source_a = (a.get("source_system") or a.get("bank_name") or "").upper()
-    source_b = (b.get("source_system") or b.get("bank_name") or "").upper()
+    source_a = _deposit_source_family(a)
+    source_b = _deposit_source_family(b)
     if source_a and source_b and source_a != source_b:
         return False
     if acct_a and acct_b and acct_a != acct_b:
@@ -208,7 +298,7 @@ def _same_deposit_slip(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
     has_count_a = count_a is not None
     has_count_b = count_b is not None
     if date_a and date_b and source_a and source_b and source_a == source_b and has_count_a != has_count_b:
-        if "CHASE" in source_a or "JPMORGAN" in source_a:
+        if source_a == "CHASE":
             return True
 
     # Require at least one stable identity besides amount so unrelated same-value slips remain distinct.
@@ -228,7 +318,7 @@ def _deposit_exact_duplicate_key(row: Dict[str, Any]) -> Optional[Tuple[Any, ...
     tx = re.sub(r"\s+", "", str(row.get("deposit_transaction") or "")).upper()
     acct = _clean_account(row.get("deposit_account") or row.get("account_last4"))
     date_value = str(row.get("deposit_date") or "")
-    source = re.sub(r"[^A-Z0-9]", "", str(row.get("source_system") or row.get("bank_name") or "").upper())
+    source = _deposit_source_family(row)
     try:
         count = int(row.get("item_count")) if row.get("item_count") is not None else None
     except (TypeError, ValueError):
@@ -282,9 +372,7 @@ def _logical_deposit_key(row: Dict[str, Any]) -> Optional[Tuple[Any, ...]]:
         return None
     amount_key = f"{round(float(amount) + 1e-9, 2):.2f}"
     date_value = str(row.get("deposit_date") or row.get("deposited_date") or "")
-    source = re.sub(r"[^A-Z0-9]", "", str(row.get("source_system") or row.get("bank_name") or "").upper())
-    if "CHASE" in source or "JPMORGAN" in source:
-        source = "CHASE"
+    source = _deposit_source_family(row)
     if date_value:
         return ("date_amount", source, date_value, amount_key)
     return ("source_amount", source, amount_key)
@@ -378,7 +466,7 @@ def _aggregate_deposit_slips(slips: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Create a single legacy deposit_slip object from logical physical deposits."""
     if not slips:
         return {}
-    slips = _dedupe_logical_deposit_slips(_dedupe_deposit_slips_exact(slips))
+    slips = _dedupe_logical_deposits(slips)
     out: Dict[str, Any] = {}
     if not slips:
         return out
@@ -1075,7 +1163,7 @@ class DocumentProcessor:
         # disappearing; this prevents long batches from truncating.
         raw_instruments = self._reconcile_register_items(raw_instruments, register_items)
         raw_instruments = _mark_unclear_instruments(raw_instruments, batch_data, deposit_data)
-        deposit_slips = _dedupe_logical_deposit_slips(_dedupe_deposit_slips_exact(deposit_slips))
+        deposit_slips = _dedupe_logical_deposits(deposit_slips)
         aggregate_deposit = _aggregate_deposit_slips(deposit_slips)
         if aggregate_deposit:
             deposit_data = {**deposit_data, **aggregate_deposit}
@@ -1353,6 +1441,10 @@ class DocumentProcessor:
             source = str(item.get("source") or "")
             report_row = source == "transaction_detail_report" or str(item.get("source_system") or "") == "Deposit Detail Report"
             sequence_row = source == "deposit_ticket_sequence"
+            # Deposit-ticket and report rows are authoritative enough to emit as REVIEW
+            # placeholders even if INCLUDE_REGISTER_ONLY_ITEMS=false in the environment.
+            # That prevents long packets from appearing to stop halfway when vision misses
+            # later money-order fronts. Generic bank register-only rows still respect the setting.
             if not (settings.include_register_only_items or report_row or sequence_row):
                 continue
             if sequence_row and item.get("matched_deposit_ticket_item"):
