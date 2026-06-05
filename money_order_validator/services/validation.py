@@ -76,6 +76,86 @@ def _property_aliases(property_name: Optional[str]) -> List[str]:
     return [a for a in aliases if a]
 
 
+def apply_batch_reconciliation(batch: BatchContext, instruments: List[Instrument]) -> None:
+    """Add batch-level amount/count reconciliation and adjust the final decision.
+
+    A matched dollar total is necessary for ACCEPT, but not sufficient. If any
+    item still has review/manual flags, the batch remains REVIEW. If totals or
+    counts do not match, the batch becomes REJECT.
+    """
+    instrument_rows = [i for i in instruments if not i.missing_from_scan]
+    instrument_sum = round(sum(float(i.amount_numeric or 0.0) for i in instrument_rows), 2)
+    deposit_total = round(float(batch.batch_amount), 2) if batch.batch_amount is not None else None
+    difference = None if deposit_total is None else round(instrument_sum - deposit_total, 2)
+    amount_tolerance = 0.01
+    amounts_match = bool(difference is not None and abs(difference) <= amount_tolerance)
+
+    instrument_count = len(instrument_rows)
+    expected_count = int(batch.total_items) if batch.total_items is not None else None
+    item_count_match = bool(expected_count is None or expected_count == instrument_count)
+
+    item_flags = []
+    for inst in instruments:
+        item_flags.extend(inst.validation.get("flags", []) if inst.validation else [])
+    has_manual_review_flags = any(
+        flag in item_flags
+        for flag in (
+            "unclear_instrument_image",
+            "low_confidence_extraction",
+            "manual_review_required",
+            "missing_serial_number",
+            "missing_amount",
+            "missing_issue_date",
+            "missing_payee",
+            "payee_mismatch",
+            "duplicate_serial_number",
+            "date_outside_120_days",
+        )
+    )
+    has_invalid_items = any((inst.validation or {}).get("overall_status") == "INVALID" for inst in instruments)
+
+    if not amounts_match or not item_count_match:
+        decision = "FAIL"
+        overall = "REJECT"
+    elif has_invalid_items or has_manual_review_flags:
+        decision = "PASS_WITH_REVIEW"
+        overall = "REVIEW"
+    else:
+        decision = "PASS"
+        overall = "ACCEPT"
+
+    flags = []
+    if amounts_match:
+        flags.append("amounts_reconciled")
+    else:
+        flags.append("amount_mismatch")
+    if item_count_match:
+        flags.append("item_count_reconciled")
+    else:
+        flags.append("item_count_mismatch")
+    if decision == "PASS_WITH_REVIEW":
+        flags.append("manual_review_required_for_item_flags")
+
+    batch.reconciliation = {
+        "instrument_sum": instrument_sum,
+        "deposit_total": deposit_total,
+        "batch_amount": deposit_total,
+        "difference": difference,
+        "amounts_match": amounts_match,
+        "instrument_count": instrument_count,
+        "expected_item_count": expected_count,
+        "item_count_match": item_count_match,
+        "decision": decision,
+        "flags": flags,
+    }
+
+    # Keep risk_summary aligned with reconciliation.
+    batch.overall_decision = overall
+    batch.risk_summary["overall_decision"] = overall
+    batch.risk_summary["reconciliation_decision"] = decision
+    batch.risk_summary["reconciliation_flags"] = flags
+
+
 def _payee_match_score(payee: Optional[str], property_name: Optional[str], extra_aliases: Optional[List[str]] = None) -> float:
     if not payee or not property_name:
         return 0.0

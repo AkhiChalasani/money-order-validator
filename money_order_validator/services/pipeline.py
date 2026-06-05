@@ -25,7 +25,7 @@ from money_order_validator.services.regex_parsers import (
     sanitize_instrument,
 )
 from money_order_validator.services.renderer import pdf_renderer
-from money_order_validator.services.validation import compute_ocr_confidence, validate_instruments
+from money_order_validator.services.validation import apply_batch_reconciliation, compute_ocr_confidence, validate_instruments
 from money_order_validator.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -859,6 +859,7 @@ class DocumentProcessor:
         batch = self._build_batch(batch_data, deposit_data, register_items, raw_instruments)
         instruments = self._build_instruments(batch, raw_instruments, file_name)
         validate_instruments(batch, instruments)
+        apply_batch_reconciliation(batch, instruments)
         # gl_summary is internal-only and excluded from the public API output.
         batch.gl_summary = []
         batch.processing_stats = self._build_stats(

@@ -28,6 +28,7 @@ class BatchContext(BaseModel):
     gl_summary: List[Dict[str, Any]] = Field(default_factory=list, exclude=True)
     overall_decision: Optional[Literal["ACCEPT", "REVIEW", "REJECT"]] = None
     processing_stats: Dict[str, Any] = Field(default_factory=dict)
+    reconciliation: Dict[str, Any] = Field(default_factory=dict)
     risk_summary: Dict[str, Any] = Field(default_factory=dict)
 
 

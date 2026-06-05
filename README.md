@@ -147,3 +147,23 @@ For Regions `Details of Deposits by Account` PDFs, page 1/2 are bank register pa
 - reconciles visible instruments against the register by check/serial/MICR suffix;
 - corrects amount OCR/cents errors from the authoritative register amount;
 - emits unmatched register rows with `missing_from_scan=true`.
+
+
+## Batch reconciliation
+
+The API compares the sum of visible/reconciled instruments against the authoritative deposit/batch total. A matching total and matching item count are required for `ACCEPT`, but they are not enough by themselves. If any instrument is unclear, missing required fields, duplicated, or otherwise flagged, the batch remains `REVIEW`. If the amount or item count does not reconcile, the batch is `REJECT`.
+
+Example response fragment:
+
+```json
+"reconciliation": {
+  "instrument_sum": 3935.34,
+  "deposit_total": 3935.34,
+  "difference": 0.0,
+  "amounts_match": true,
+  "instrument_count": 7,
+  "expected_item_count": 7,
+  "item_count_match": true,
+  "decision": "PASS"
+}
+```
