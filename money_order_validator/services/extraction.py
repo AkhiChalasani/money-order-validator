@@ -8,6 +8,7 @@ from PIL import Image
 from money_order_validator.clients.azure_openai import llm_client
 from money_order_validator.prompts import (
     BATCH_HEADER_PROMPT,
+    DEPOSIT_DETAIL_REPORT_ITEMS_PROMPT,
     DEPOSIT_SLIP_PROMPT,
     DEPOSIT_TICKET_ITEMS_PROMPT,
     INSTRUMENT_EXTRACTION_PROMPT,
@@ -23,6 +24,7 @@ from money_order_validator.services.regex_parsers import (
     parse_basic_instrument_from_ocr,
     parse_batch_line_items,
     parse_deposit_info,
+    parse_transaction_detail_items,
     sanitize_instrument,
 )
 from money_order_validator.settings import settings
@@ -248,6 +250,91 @@ class VisionExtractor:
             best_score, best_items = max(candidates, key=lambda c: c[0])
 
         return best_items, total_usage, True
+
+    async def extract_deposit_detail_report_items(self, image: Image.Image, ocr_text: str) -> Tuple[List[Dict[str, Any]], TokenUsage, bool]:
+        """Extract authoritative rows from Deposit Detail Report pages.
+
+        Reads the printed report row table and ignores embedded thumbnail instrument
+        images, which may be too small or duplicated.
+        """
+        import re as _re
+        parsed = parse_transaction_detail_items(ocr_text)
+        if not llm_client.available:
+            return parsed, TokenUsage(), False
+
+        prompt = DEPOSIT_DETAIL_REPORT_ITEMS_PROMPT.replace(
+            "{ocr_context}", compact_ocr_context(ocr_text, max_chars=4000) or "(no OCR text available)"
+        )
+        raw, usage = await llm_client.json_vision(
+            system_prompt=LLM_SYSTEM_MSG,
+            user_prompt=prompt,
+            image=crop_to_content(image),
+            max_width=settings.report_image_width,
+            detail="high",
+            max_completion_tokens=3000,
+        )
+        rows = raw.get("items") if isinstance(raw, dict) else None
+        if not isinstance(rows, list):
+            return parsed, usage, True
+
+        items: List[Dict[str, Any]] = []
+        for idx, row in enumerate(rows, start=1):
+            if not isinstance(row, dict):
+                continue
+            item_type = str(row.get("item_type") or "")
+            if bool(row.get("is_deposit_total")) or item_type.lower() == "credit":
+                continue
+            amount = row.get("amount_numeric")
+            try:
+                amount_f = round(float(str(amount).replace("$", "").replace(",", "")), 2)
+            except (TypeError, ValueError):
+                continue
+            if amount_f <= 0 or amount_f > 5000:
+                continue
+            account = "".join(ch for ch in str(row.get("account_number") or "") if ch.isdigit()) or None
+            check = "".join(ch for ch in str(row.get("check_number") or "") if ch.isdigit()) or None
+            aux_raw = row.get("aux_serial") or row.get("serial_number") or check
+            serial = str(aux_raw).strip() if aux_raw not in (None, "") else None
+            if serial:
+                serial = "".join(ch for ch in serial if ch.isalnum()) or None
+            if not serial and account:
+                m = _re.search(r"(?:40)?((?:19|22)\d{7,10})\d?$", account)
+                if m:
+                    serial = m.group(1)
+                elif len(account) >= 9:
+                    serial = account[-10:]
+            routing = "".join(ch for ch in str(row.get("routing_number") or "") if ch.isdigit()) or None
+            items.append(
+                {
+                    "item_no": row.get("item_no") or idx,
+                    "routing_number": routing,
+                    "account_number": account,
+                    "check_number": check,
+                    "serial_number": serial,
+                    "amount_numeric": amount_f,
+                    "instrument_type": "MoneyOrder",
+                    "payment_description": "Payment-MoneyOrder",
+                    "source": "transaction_detail_report",
+                    "source_system": "Deposit Detail Report",
+                    "image_quality": "thumbnail_report_image",
+                    "review_flags": ["report_thumbnail_item", "manual_review_required"],
+                }
+            )
+
+        # Merge OCR regex rows with vision rows, preferring the larger unique set.
+        combined = parsed + items
+        seen: set = set()
+        unique: List[Dict[str, Any]] = []
+        for item in combined:
+            key = (
+                str(item.get("serial_number") or item.get("account_number") or ""),
+                round(float(item.get("amount_numeric") or 0.0), 2),
+            )
+            if key in seen or key == ("", 0.0):
+                continue
+            seen.add(key)
+            unique.append(item)
+        return unique, usage, True
 
     async def extract_register_items(self, image: Image.Image, ocr_text: str) -> Tuple[List[Dict[str, Any]], TokenUsage, bool]:
         """Extract bank/property register rows from a deposit report page.

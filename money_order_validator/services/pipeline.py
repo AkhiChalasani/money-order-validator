@@ -798,7 +798,20 @@ class DocumentProcessor:
             if kind in {PageKind.BATCH_HEADER, PageKind.DEPOSIT_REPORT, PageKind.REPORT_WITH_INSTRUMENTS, PageKind.DEPOSIT_SLIP, PageKind.UNKNOWN, PageKind.RECEIPT}:
                 _merge_non_empty(batch_data, parse_batch_header(ocr_text))
                 new_items = parse_batch_line_items(ocr_text)
-                if not new_items and _should_extract_register_with_vision(kind, ocr_text, page_deposit):
+                if page_is_deposit_detail_report:
+                    # Deposit Detail Report rows are authoritative. Always use the
+                    # focused row-table extractor because Azure OCR often misses
+                    # rows from the black report table or confuses thumbnail text.
+                    detail_items, usage, used = await vision_extractor.extract_deposit_detail_report_items(image, ocr_text)
+                    if used:
+                        llm_calls += 1
+                        self._accumulate_usage(usage_total, usage)
+                        phase_tokens["deposit_detail_rows"] += usage.total_tokens
+                        log_row["llm_used"] = True
+                        log_row["deposit_detail_rows_vision_used"] = True
+                    if detail_items:
+                        new_items = detail_items
+                elif not new_items and _should_extract_register_with_vision(kind, ocr_text, page_deposit):
                     new_items, usage, used = await vision_extractor.extract_register_items(image, ocr_text)
                     if used:
                         llm_calls += 1
@@ -807,7 +820,11 @@ class DocumentProcessor:
                         log_row["llm_used"] = True
                         log_row["register_vision_used"] = True
                 if new_items:
+                    for row in new_items:
+                        row.setdefault("report_page_number", page_number)
                     register_items.extend(new_items)
+                    if page_is_deposit_detail_report:
+                        log_row["deposit_detail_report_items"] = len(new_items)
 
             # Receipts and mixed deposit-ticket+instrument pages may carry the authoritative
             # deposit total. This is page-scoped, not global: a single PDF can contain multiple
@@ -874,8 +891,8 @@ class DocumentProcessor:
                 page_logs.append(log_row)
                 continue
 
-            should_extract = kind in {PageKind.INSTRUMENT, PageKind.REPORT_WITH_INSTRUMENTS}
-            if kind == PageKind.UNKNOWN:
+            should_extract = False if page_is_deposit_detail_report else (kind == PageKind.INSTRUMENT or kind == PageKind.REPORT_WITH_INSTRUMENTS)
+            if kind == PageKind.UNKNOWN and not page_is_deposit_detail_report:
                 should_extract = _should_try_unknown_vision(ocr_text)
             if should_extract:
                 instruments, usage, used = await vision_extractor.extract_instruments(image, ocr_text, kind, page_angle=page_angle)
@@ -1199,13 +1216,19 @@ class DocumentProcessor:
                 if not (item.get("serial_number") or item.get("amount_numeric")):
                     continue
                 inst_type = "MoneyOrder" if "Money" in (item.get("payment_description") or "") else "Check"
+                source = str(item.get("source") or "")
+                report_row = source == "transaction_detail_report" or str(item.get("source_system") or "") == "Deposit Detail Report"
                 instruments.append(
                     {
                         **item,
                         "instrument_type": inst_type,
+                        "payment_description": item.get("payment_description") or "Payment-Check",
                         "llm_used": False,
                         "processing_tier": 1,
-                        "missing_from_scan": True,
+                        "missing_from_scan": False if report_row else True,
+                        "matched_register_item": bool(report_row),
+                        "image_quality": item.get("image_quality") or ("thumbnail_report_image" if report_row else None),
+                        "review_flags": item.get("review_flags") or (["report_thumbnail_item", "manual_review_required"] if report_row else []),
                     }
                 )
         return instruments

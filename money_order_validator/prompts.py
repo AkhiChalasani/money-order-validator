@@ -133,6 +133,41 @@ OCR context:
 """.strip()
 
 
+DEPOSIT_DETAIL_REPORT_ITEMS_PROMPT = """
+Extract the authoritative transaction rows from this Deposit Detail Report page.
+
+Return JSON only:
+{
+  "items": [
+    {
+      "item_no": integer|null,
+      "aux_serial": string|null,
+      "routing_number": string|null,
+      "account_number": string|null,
+      "check_number": string|null,
+      "amount_numeric": number|null,
+      "item_type": string|null,
+      "is_deposit_total": boolean
+    }
+  ]
+}
+
+Rules:
+- Read the printed black-header table rows, not the thumbnail image text.
+- Table headers usually include AUX/Serial, RIC, RT, WAUX/FLD4, Account, Check, Amount, Item Type, Item Status.
+- The first ELECTRONIC/Credit row is the aggregate deposit total. Mark it is_deposit_total=true.
+- Do NOT return the aggregate credit row as a physical payment item. It can be included only if is_deposit_total=true.
+- All later rows with Item Type like 0003 or Debit are physical deposited payment items.
+- Use the printed row amount above each thumbnail as amount_numeric. Do not use handwritten amount in the thumbnail when the row amount is visible.
+- Preserve cents exactly. $294.36 must remain 294.36, not 294.56.
+- If AUX/Serial is blank, derive serial_number later from account_number; leave aux_serial null.
+- Return each visible printed row once. Do not duplicate rows from thumbnail front/back images.
+
+OCR context:
+{ocr_context}
+""".strip()
+
+
 REGISTER_ITEMS_PROMPT = """
 Extract the item/register rows from this bank deposit report or property-management batch table.
 Return JSON only:
