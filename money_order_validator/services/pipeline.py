@@ -450,6 +450,19 @@ def _row_has_real_front_evidence(row: Dict[str, Any]) -> bool:
     )
 
 
+def _strip_output_debug_fields(value: Any) -> Any:
+    """Remove internal correction/debug metadata from the public API payload."""
+    if isinstance(value, dict):
+        return {
+            k: _strip_output_debug_fields(v)
+            for k, v in value.items()
+            if k not in {"corrections", "_ocr_text", "_page_item_index"}
+        }
+    if isinstance(value, list):
+        return [_strip_output_debug_fields(v) for v in value]
+    return value
+
+
 def _low_evidence_form_or_back_row(row: Dict[str, Any]) -> bool:
     """Rows emitted from backs/deposit tickets often have only issuer/amount and no face fields."""
     return bool(
@@ -800,13 +813,19 @@ class DocumentProcessor:
         )
         batch.processing_stats["deposit_slips_extracted"] = len(deposit_slips)
 
+        # Hide internal reconciliation/correction history from public JSON output.
+        # This keeps the API response clean while preserving the corrected values.
+        public_deposit_data = _strip_output_debug_fields(deposit_data) if deposit_data else None
+        public_deposit_slips = _strip_output_debug_fields(deposit_slips) if deposit_slips else None
+        public_pages = _strip_output_debug_fields(page_logs) if settings.return_debug_pages else None
+
         return ValidationResult(
             file_name=file_name,
             batch=batch,
             instruments=instruments,
-            deposit_slip=deposit_data or None,
-            deposit_slips=deposit_slips or None,
-            pages=page_logs if settings.return_debug_pages else None,
+            deposit_slip=public_deposit_data,
+            deposit_slips=public_deposit_slips,
+            pages=public_pages,
         )
 
     @staticmethod
@@ -886,6 +905,7 @@ class DocumentProcessor:
             score += 1
         return score
 
+    @staticmethod
     def _drop_form_and_back_artifacts(rows: List[Dict[str, Any]], deposit_slips: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Remove pseudo instruments created from deposit tickets and adjacent back pages."""
         deposit_pages = {
