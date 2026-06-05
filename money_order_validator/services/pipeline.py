@@ -1377,7 +1377,14 @@ class DocumentProcessor:
 
                 if row.get("unit") and not inst.get("unit"):
                     inst["unit"] = str(row.get("unit"))
+                # Preserve the exact deposit-ticket row that this instrument consumed.
+                # Without this link, later reconciliation cannot know which handwritten
+                # ticket rows are still unmatched and long batches appear to stop early.
                 inst["matched_deposit_ticket_item"] = True
+                inst["matched_deposit_slip_page"] = slip_page
+                inst["matched_deposit_row_item_no"] = row.get("item_no")
+                inst["register_source"] = inst.get("register_source") or "deposit_ticket_sequence"
+                row["matched_deposit_ticket_item"] = True
         return instruments
 
     def _reconcile_register_items(self, instruments: List[Dict[str, Any]], items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1435,31 +1442,53 @@ class DocumentProcessor:
         # that GPT vision read clearly, making the response appear to stop around
         # page 43. Sequence/report rows are authoritative enough to emit as
         # REVIEW placeholders when they are not matched to a clear front image.
+        # Emit unmatched authoritative rows. Generic register-only rows still honor
+        # INCLUDE_REGISTER_ONLY_ITEMS, but physical deposit-ticket rows and Deposit
+        # Detail Report rows must always be returned as REVIEW placeholders.
+        # Otherwise the API can read all pages/register rows but appear to stop
+        # halfway through the batch (Batch 21 stopped at page 43 while
+        # register_items_extracted was already 42).
+        consumed_sequence_keys = {
+            (inst.get("matched_deposit_slip_page"), str(inst.get("matched_deposit_row_item_no") or ""))
+            for inst in instruments
+            if inst.get("matched_deposit_slip_page") is not None and inst.get("matched_deposit_row_item_no") is not None
+        }
+        emitted_placeholder_keys: set = {
+            (inst.get("slip_page_number"), str(inst.get("item_no") or ""))
+            for inst in instruments
+            if str(inst.get("source") or "") == "deposit_ticket_sequence"
+        }
+
         for idx, item in enumerate(items):
             if idx in matched_items:
                 continue
             # Add only credible register items. These help expose missing scans.
             if not (item.get("serial_number") or item.get("amount_numeric")):
                 continue
-
             source = str(item.get("source") or "")
             report_row = source == "transaction_detail_report" or str(item.get("source_system") or "") == "Deposit Detail Report"
             sequence_row = source == "deposit_ticket_sequence"
-
-            # Generic register-only rows still respect the feature flag. Physical
-            # deposit-ticket sequence rows and Deposit Detail Report rows are always
-            # emitted as REVIEW placeholders, otherwise long batches silently lose
-            # items even though register_items_extracted is correct.
             if not (settings.include_register_only_items or report_row or sequence_row):
                 continue
-
-            if sequence_row and item.get("matched_deposit_ticket_item"):
-                continue
-
+            if sequence_row:
+                key = (item.get("slip_page_number"), str(item.get("item_no") or ""))
+                if key in consumed_sequence_keys or key in emitted_placeholder_keys:
+                    continue
             default_type = "MoneyOrder" if (sequence_row or "Money" in (item.get("payment_description") or "")) else "Check"
             default_description = "Payment-MoneyOrder" if default_type == "MoneyOrder" else "Payment-Check"
+            # Estimate the physical page for Chase ticket rows: in these packets each
+            # ticket row is followed by a front/back pair, so row 1 after page 23 is
+            # page 25, row 2 page 27, etc. This keeps later unmatched placeholders
+            # visibly after page 43 instead of looking disconnected from the scan.
+            placeholder_page = item.get("page_number")
+            if sequence_row and not placeholder_page:
+                try:
+                    placeholder_page = int(item.get("slip_page_number")) + int(item.get("item_no") or 0) * 2
+                except (TypeError, ValueError):
+                    placeholder_page = None
             placeholder = {
                 **item,
+                "page_number": placeholder_page or item.get("page_number"),
                 "instrument_type": item.get("instrument_type") or default_type,
                 "payment_description": item.get("payment_description") or default_description,
                 "llm_used": False,
@@ -1469,11 +1498,11 @@ class DocumentProcessor:
                 "image_quality": item.get("image_quality") or ("thumbnail_report_image" if report_row else ("not_extracted_from_scan" if sequence_row else None)),
                 "review_flags": item.get("review_flags") or (["report_thumbnail_item", "manual_review_required"] if report_row else (["deposit_ticket_item_not_matched_to_clear_instrument", "manual_review_required"] if sequence_row else [])),
             }
-            # Make placeholder rows visible in final validation even if the raw row
-            # lacked image-quality metadata.
             if sequence_row:
                 placeholder.setdefault("ocr_confidence", 0.6)
             instruments.append(placeholder)
+            if sequence_row:
+                emitted_placeholder_keys.add((item.get("slip_page_number"), str(item.get("item_no") or "")))
         return instruments
 
     @staticmethod
