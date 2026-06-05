@@ -270,6 +270,81 @@ def _dedupe_deposit_slips_exact(slips: List[Dict[str, Any]]) -> List[Dict[str, A
     return out
 
 
+def _logical_deposit_key(row: Dict[str, Any]) -> Optional[Tuple[Any, ...]]:
+    """Key for public deposit aggregation.
+
+    Chase teller receipts and physical deposit tickets describe the same deposit
+    with different account OCR or missing transaction fields. Exact same
+    source/date/amount in cents is one logical deposit.
+    """
+    amount = _deposit_amount_value(row)
+    if amount is None:
+        return None
+    amount_key = f"{round(float(amount) + 1e-9, 2):.2f}"
+    date_value = str(row.get("deposit_date") or row.get("deposited_date") or "")
+    source = re.sub(r"[^A-Z0-9]", "", str(row.get("source_system") or row.get("bank_name") or "").upper())
+    if "CHASE" in source or "JPMORGAN" in source:
+        source = "CHASE"
+    if date_value:
+        return ("date_amount", source, date_value, amount_key)
+    return ("source_amount", source, amount_key)
+
+
+def _deposit_row_score(row: Dict[str, Any]) -> int:
+    """Prefer physical tickets with counts over receipt/metadata rows when merging."""
+    score = 0
+    if _deposit_amount_value(row) is not None:
+        score += 10
+    if row.get("item_count") is not None:
+        score += 8
+    if row.get("check_total") is not None or row.get("deposit_total") is not None:
+        score += 4
+    if row.get("deposit_account") not in (None, "", [], {}):
+        score += 2
+    return score
+
+
+def _dedupe_logical_deposit_slips(slips: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Collapse receipt + ticket duplicates before public totals are calculated.
+
+    Rows without an amount are metadata-only and must not become separate deposit slips.
+    Same amount/date/source in cents is treated as the same deposit.
+    """
+    out: List[Dict[str, Any]] = []
+    seen: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+    for row in slips:
+        if _deposit_amount_value(row) is None:
+            continue
+        key = _logical_deposit_key(row) or _deposit_exact_duplicate_key(row)
+        if key is None:
+            out.append(row)
+            continue
+        existing = seen.get(key)
+        if existing is None:
+            seen[key] = row
+            out.append(row)
+            continue
+        keep, merge = (existing, row)
+        if _deposit_row_score(row) > _deposit_row_score(existing):
+            idx = out.index(existing)
+            out[idx] = row
+            seen[key] = row
+            keep, merge = row, existing
+        prior_page = keep.get("page_number")
+        merge_page = merge.get("page_number")
+        _merge_non_empty(keep, merge)
+        for field in ("deposit_amount", "deposit_total", "check_total", "item_count"):
+            if row.get(field) not in (None, "", [], {}) and _deposit_row_score(row) >= _deposit_row_score(existing):
+                keep[field] = row[field]
+        pages = keep.setdefault("source_pages", [])
+        for pg in (prior_page, merge_page):
+            if pg and pg not in pages:
+                pages.append(pg)
+        if pages:
+            keep["page_number"] = min(pages)
+    return out
+
+
 def _is_meaningful_deposit(row: Dict[str, Any]) -> bool:
     if not row:
         return False
@@ -300,29 +375,29 @@ def _add_deposit_slip(slips: List[Dict[str, Any]], patch: Dict[str, Any], page_n
 
 
 def _aggregate_deposit_slips(slips: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Create a single legacy deposit_slip object from one or more physical slips/receipts."""
+    """Create a single legacy deposit_slip object from logical physical deposits."""
     if not slips:
         return {}
-    slips = _dedupe_deposit_slips_exact(slips)
+    slips = _dedupe_logical_deposit_slips(_dedupe_deposit_slips_exact(slips))
     out: Dict[str, Any] = {}
+    if not slips:
+        return out
     for row in slips:
-        # Non-total metadata: keep the first useful value. deposit_date handled separately
-        # because upside-down handwritten slips can OCR 2026 as 2024.
         for key in ("bank_name", "source_system", "account_last4", "account_name"):
             if not out.get(key) and row.get(key) not in (None, "", [], {}):
                 out[key] = row[key]
     accounts = [str(row.get("deposit_account")) for row in slips if row.get("deposit_account") not in (None, "", [], {})]
     if accounts:
-        # Chase deposit tickets often OCR the first MICR group as the account on one page and the
-        # true deposit account on a later ticket. Prefer the latest non-empty account for the batch.
-        out["deposit_account"] = accounts[-1]
+        # Prefer short real account values over MICR fragments accidentally read
+        # from an instrument at the bottom of a deposit ticket.
+        preferred = [a for a in accounts if 3 <= len(re.sub(r"\D", "", a)) <= 9]
+        out["deposit_account"] = (preferred or accounts)[-1]
     dates = [str(row.get("deposit_date")) for row in slips if row.get("deposit_date")]
     if dates:
         out["deposit_date"] = sorted(dates)[-1]
     amounts = [_deposit_amount_value(row) for row in slips if _deposit_amount_value(row) is not None]
-    unique_amount_slips = [row for row in slips if _deposit_amount_value(row) is not None]
     if amounts:
-        total = round(sum(amounts), 2) if len(unique_amount_slips) > 1 else amounts[0]
+        total = round(sum(amounts), 2) if len(amounts) > 1 else amounts[0]
         out["deposit_amount"] = total
         out["deposit_total"] = total
         out["check_total"] = total
@@ -594,7 +669,13 @@ def _adjust_deposit_slips_from_sequence_items(slips: List[Dict[str, Any]], items
         except (TypeError, ValueError):
             item_count = 0
         old_amount = _deposit_amount_value(slip)
-        if (item_count and item_count == len(rows)) or old_amount is None or abs(row_sum - float(old_amount)) >= 10.0:
+        # Row OCR is useful when the visible slip total is missing, but must not
+        # lower a teller/receipt total. Only fill missing totals or safely raise
+        # a clearly lower slip amount when every row was read.
+        should_replace = old_amount is None
+        if old_amount is not None and item_count and item_count == len(rows) and row_sum > float(old_amount) + 1.00:
+            should_replace = True
+        if should_replace:
             slip["deposit_amount"] = row_sum
             slip["deposit_total"] = row_sum
             slip["check_total"] = row_sum
@@ -994,7 +1075,7 @@ class DocumentProcessor:
         # disappearing; this prevents long batches from truncating.
         raw_instruments = self._reconcile_register_items(raw_instruments, register_items)
         raw_instruments = _mark_unclear_instruments(raw_instruments, batch_data, deposit_data)
-        deposit_slips = _dedupe_deposit_slips_exact(deposit_slips)
+        deposit_slips = _dedupe_logical_deposit_slips(_dedupe_deposit_slips_exact(deposit_slips))
         aggregate_deposit = _aggregate_deposit_slips(deposit_slips)
         if aggregate_deposit:
             deposit_data = {**deposit_data, **aggregate_deposit}
@@ -1261,33 +1342,36 @@ class DocumentProcessor:
                 if not inst.get("serial_number") and item.get("serial_number"):
                     inst["serial_number"] = item["serial_number"]
 
-        if settings.include_register_only_items:
-            for idx, item in enumerate(items):
-                if idx in matched_items:
-                    continue
-                # Add only credible register items. These help expose missing scans.
-                if not (item.get("serial_number") or item.get("amount_numeric")):
-                    continue
-                source = str(item.get("source") or "")
-                report_row = source == "transaction_detail_report" or str(item.get("source_system") or "") == "Deposit Detail Report"
-                sequence_row = source == "deposit_ticket_sequence"
-                if sequence_row and item.get("matched_deposit_ticket_item"):
-                    continue
-                default_type = "MoneyOrder" if (sequence_row or "Money" in (item.get("payment_description") or "")) else "Check"
-                default_description = "Payment-MoneyOrder" if default_type == "MoneyOrder" else "Payment-Check"
-                instruments.append(
-                    {
-                        **item,
-                        "instrument_type": item.get("instrument_type") or default_type,
-                        "payment_description": item.get("payment_description") or default_description,
-                        "llm_used": False,
-                        "processing_tier": 1,
-                        "missing_from_scan": False if (report_row or sequence_row) else True,
-                        "matched_register_item": bool(report_row or sequence_row),
-                        "image_quality": item.get("image_quality") or ("thumbnail_report_image" if report_row else ("not_extracted_from_scan" if sequence_row else None)),
-                        "review_flags": item.get("review_flags") or (["report_thumbnail_item", "manual_review_required"] if report_row else (["deposit_ticket_item_not_matched_to_clear_instrument", "manual_review_required"] if sequence_row else [])),
-                    }
-                )
+        for idx, item in enumerate(items):
+            if idx in matched_items:
+                continue
+            # Add only credible register items. Deposit-ticket sequence rows and
+            # report rows are always emitted regardless of include_register_only_items
+            # so long batches never appear truncated.
+            if not (item.get("serial_number") or item.get("amount_numeric")):
+                continue
+            source = str(item.get("source") or "")
+            report_row = source == "transaction_detail_report" or str(item.get("source_system") or "") == "Deposit Detail Report"
+            sequence_row = source == "deposit_ticket_sequence"
+            if not (settings.include_register_only_items or report_row or sequence_row):
+                continue
+            if sequence_row and item.get("matched_deposit_ticket_item"):
+                continue
+            default_type = "MoneyOrder" if (sequence_row or "Money" in (item.get("payment_description") or "")) else "Check"
+            default_description = "Payment-MoneyOrder" if default_type == "MoneyOrder" else "Payment-Check"
+            instruments.append(
+                {
+                    **item,
+                    "instrument_type": item.get("instrument_type") or default_type,
+                    "payment_description": item.get("payment_description") or default_description,
+                    "llm_used": False,
+                    "processing_tier": 1,
+                    "missing_from_scan": False if (report_row or sequence_row) else True,
+                    "matched_register_item": bool(report_row or sequence_row),
+                    "image_quality": item.get("image_quality") or ("thumbnail_report_image" if report_row else ("not_extracted_from_scan" if sequence_row else None)),
+                    "review_flags": item.get("review_flags") or (["report_thumbnail_item", "manual_review_required"] if report_row else (["deposit_ticket_item_not_matched_to_clear_instrument", "manual_review_required"] if sequence_row else [])),
+                }
+            )
         return instruments
 
     @staticmethod

@@ -197,8 +197,8 @@ def validate_instruments(batch: BatchContext, instruments: List[Instrument]) -> 
             flags.append("missing_physical_instrument - present in batch/register but no matching scan was extracted")
             score += 0.35
 
-        if inst.image_quality == "unclear":
-            flags.append("unclear_instrument_image")
+        if inst.image_quality in {"unclear", "not_extracted_from_scan", "unread_report_row"}:
+            flags.append("unclear_instrument_image" if inst.image_quality == "unclear" else "deposit_ticket_item_not_matched_to_clear_instrument")
             flags.append("low_confidence_extraction")
             flags.append("manual_review_required")
             score += 0.18
