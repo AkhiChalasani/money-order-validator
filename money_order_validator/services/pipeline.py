@@ -200,6 +200,17 @@ def _same_deposit_slip(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
                 return False
         except (TypeError, ValueError):
             return False
+    # Chase receipt pages often show the same deposit total as the handwritten
+    # deposit ticket, but OCR may expose different account fragments. When the
+    # exact amount/date/source match and exactly one side has an item_count,
+    # treat the receipt as metadata for the physical ticket rather than a second
+    # deposit. This fixes duplicate totals where receipts duplicated tickets.
+    has_count_a = count_a is not None
+    has_count_b = count_b is not None
+    if date_a and date_b and source_a and source_b and source_a == source_b and has_count_a != has_count_b:
+        if "CHASE" in source_a or "JPMORGAN" in source_a:
+            return True
+
     # Require at least one stable identity besides amount so unrelated same-value slips remain distinct.
     return bool((acct_a and acct_b) or (date_a and date_b) or (count_a is not None and count_b is not None))
 
@@ -977,8 +988,11 @@ class DocumentProcessor:
         raw_instruments = self._apply_deposit_ticket_sequences(raw_instruments, register_items)
         raw_instruments = self._drop_form_and_back_artifacts(raw_instruments, deposit_slips)
         _correct_deposit_slips_from_following_instruments(deposit_slips, raw_instruments)
-        non_sequence_register_items = [i for i in register_items if i.get("source") != "deposit_ticket_sequence"]
-        raw_instruments = self._reconcile_register_items(raw_instruments, non_sequence_register_items)
+        # Reconcile against every authoritative row. Deposit-ticket sequence rows
+        # are not as rich as bank register rows, but they carry count/amount/order.
+        # Unmatched sequence rows are emitted as REVIEW placeholders instead of
+        # disappearing; this prevents long batches from truncating.
+        raw_instruments = self._reconcile_register_items(raw_instruments, register_items)
         raw_instruments = _mark_unclear_instruments(raw_instruments, batch_data, deposit_data)
         deposit_slips = _dedupe_deposit_slips_exact(deposit_slips)
         aggregate_deposit = _aggregate_deposit_slips(deposit_slips)
@@ -1152,9 +1166,11 @@ class DocumentProcessor:
             targets.sort(key=lambda r: (r.get("page_number") or 999999, r.get("_page_item_index") or 0))
             if not seq_rows or not targets:
                 continue
-            if abs(len(seq_rows) - len(targets)) > 1:
-                continue
+            # Apply the rows we can align by physical order even when extraction
+            # stopped early. Unmatched deposit-ticket rows are emitted as review
+            # placeholders so a long batch does not appear to stop halfway through.
             for row, inst in zip(seq_rows, targets):
+                row["matched_deposit_ticket_item"] = True
                 seq_amount = _as_float(row.get("amount_numeric"))
                 if seq_amount is None:
                     continue
@@ -1252,20 +1268,24 @@ class DocumentProcessor:
                 # Add only credible register items. These help expose missing scans.
                 if not (item.get("serial_number") or item.get("amount_numeric")):
                     continue
-                inst_type = "MoneyOrder" if "Money" in (item.get("payment_description") or "") else "Check"
                 source = str(item.get("source") or "")
                 report_row = source == "transaction_detail_report" or str(item.get("source_system") or "") == "Deposit Detail Report"
+                sequence_row = source == "deposit_ticket_sequence"
+                if sequence_row and item.get("matched_deposit_ticket_item"):
+                    continue
+                default_type = "MoneyOrder" if (sequence_row or "Money" in (item.get("payment_description") or "")) else "Check"
+                default_description = "Payment-MoneyOrder" if default_type == "MoneyOrder" else "Payment-Check"
                 instruments.append(
                     {
                         **item,
-                        "instrument_type": inst_type,
-                        "payment_description": item.get("payment_description") or "Payment-Check",
+                        "instrument_type": item.get("instrument_type") or default_type,
+                        "payment_description": item.get("payment_description") or default_description,
                         "llm_used": False,
                         "processing_tier": 1,
-                        "missing_from_scan": False if report_row else True,
-                        "matched_register_item": bool(report_row),
-                        "image_quality": item.get("image_quality") or ("thumbnail_report_image" if report_row else None),
-                        "review_flags": item.get("review_flags") or (["report_thumbnail_item", "manual_review_required"] if report_row else []),
+                        "missing_from_scan": False if (report_row or sequence_row) else True,
+                        "matched_register_item": bool(report_row or sequence_row),
+                        "image_quality": item.get("image_quality") or ("thumbnail_report_image" if report_row else ("not_extracted_from_scan" if sequence_row else None)),
+                        "review_flags": item.get("review_flags") or (["report_thumbnail_item", "manual_review_required"] if report_row else (["deposit_ticket_item_not_matched_to_clear_instrument", "manual_review_required"] if sequence_row else [])),
                     }
                 )
         return instruments
