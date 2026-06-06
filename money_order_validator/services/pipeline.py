@@ -1464,6 +1464,15 @@ class DocumentProcessor:
             for inst in instruments
             if inst.get("matched_deposit_slip_page") is not None and inst.get("matched_deposit_row_item_no") is not None
         }
+        # When the same deposit ticket exists as multiple copies (e.g. original page 1
+        # + pink copy page 3 in batch 46), both produce sequence rows but only the copy
+        # closest to the instruments gets matched. Suppress placeholders for any row whose
+        # item_no+amount was already consumed by a different slip page copy.
+        consumed_sequence_amounts = {
+            (str(inst.get("matched_deposit_row_item_no") or ""), _as_float(inst.get("amount_numeric")))
+            for inst in instruments
+            if inst.get("matched_deposit_slip_page") is not None and inst.get("matched_deposit_row_item_no") is not None
+        }
         emitted_placeholder_keys: set = {
             (inst.get("slip_page_number"), str(inst.get("item_no") or ""))
             for inst in instruments
@@ -1484,6 +1493,11 @@ class DocumentProcessor:
             if sequence_row:
                 key = (item.get("slip_page_number"), str(item.get("item_no") or ""))
                 if key in consumed_sequence_keys or key in emitted_placeholder_keys:
+                    continue
+                # Also suppress if a matching amount+item_no was consumed from a different
+                # copy of the same deposit ticket (e.g. original + pink copy, batch 46).
+                amount_key = (str(item.get("item_no") or ""), _as_float(item.get("amount_numeric")))
+                if amount_key[0] and amount_key in consumed_sequence_amounts:
                     continue
             default_type = "MoneyOrder" if (sequence_row or "Money" in (item.get("payment_description") or "")) else "Check"
             default_description = "Payment-MoneyOrder" if default_type == "MoneyOrder" else "Payment-Check"
@@ -1576,6 +1590,10 @@ class DocumentProcessor:
 
         property_name = batch_data.get("property_name") or deposit_data.get("account_name")
         inferred_property = False
+        # Upside-down deposit ticket OCR often produces garbled names with digits embedded
+        # inside alphabetic words (e.g. "Ihtnavar2"). Flag these as bad candidates.
+        if property_name and re.search(r'[A-Za-z]{2,}\d+\b', property_name or ""):
+            property_name = None
         if _bad_property_candidate(property_name):
             property_name = _infer_property_from_instruments(instruments) or None
             inferred_property = True
